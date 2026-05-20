@@ -85,3 +85,32 @@ def load_graph_levels(
         graph_levels.append(g)
 
     return graph_levels
+
+
+def load_coarse_edges_for_diffpool(
+    path_levels: Path,
+    n_levels: int,
+    device: str = 'cpu'
+):
+    """Load pre-computed coarse edge_index/edge_weight/parents for each level.
+
+    Used by DiffPool's hybrid early-mode levels that keep fixed coarse edges
+    and use HEM parent mappings for efficient scatter pooling.
+
+    Returns
+    -------
+    coarse_edges : list of (edge_index, edge_weight) tuples
+        One per level, edges for the graph at that level.
+    parents_list : list of torch.Tensor
+        One per level, parent mapping from level i to level i+1.
+    """
+    path_levels = Path(path_levels)
+    coarse_edges = []
+    parents_list = []
+    for level in range(n_levels):
+        edge_index = torch.load(path_levels / f"edge_index_lvl{level}.pt")
+        edge_weight = torch.load(path_levels / f"edge_weight_lvl{level}.pt")
+        parents = torch.load(path_levels / f"parents_lvl{level}.pt")
+        coarse_edges.append((edge_index.to(device), edge_weight.to(device)))
+        parents_list.append(parents.to(device))
+    return coarse_edges, parents_list

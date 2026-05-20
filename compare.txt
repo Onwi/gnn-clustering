@@ -1,0 +1,12 @@
+-- Validation accuracy: 0.92
+-- Validation loss: 0.2785
+-- Train loss: 0.4168
+-- Train accuracy: 0.8776
+-- Validation Metrics: {'loss': 0.27846652776002884, 'balanced_accuracy': 0.8841746906484382, 'accuracy': 0.918234912394549}
+
+
+
+-- Validation accuracy: 0.24
+-- Validation loss: 2.3068
+-- Train loss: 2.3580
+-- Train accuracy: 0.2387

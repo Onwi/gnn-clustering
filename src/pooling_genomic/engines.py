@@ -3,6 +3,8 @@ import torch
 from torch.nn import CrossEntropyLoss
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
 
+from pooling_genomic.models import get_diffpool_aux_losses
+
 
 def train_epoch_clf(
     model,
@@ -13,7 +15,9 @@ def train_epoch_clf(
     print_period: int = 5,
     scheduler=None,
     epoch=None,
-    lambda_l1_node_importances: float = None
+    lambda_l1_node_importances: float = None,
+    lambda_link_pred: float = 0.0,
+    lambda_entropy: float = 0.0,
 ):
     model.train()
 
@@ -33,6 +37,9 @@ def train_epoch_clf(
         if lambda_l1_node_importances is not None:
             for ni in model[0].node_importances:
                 loss += lambda_l1_node_importances * torch.sum(torch.abs(ni)) / ni.size()[0]
+
+        aux_loss = get_diffpool_aux_losses(model, lambda_link_pred, lambda_entropy)
+        loss = loss + aux_loss
 
         loss.backward()
         optimizer.step()
@@ -131,7 +138,9 @@ def train_cohort_tumor_clf(
     print_period: int = 5,
     scheduler=None,
     epoch=None,
-    lambda_l1_node_importances: float = None
+    lambda_l1_node_importances: float = None,
+    lambda_link_pred: float = 0.0,
+    lambda_entropy: float = 0.0,
 ):
     model.train()
 
@@ -152,6 +161,9 @@ def train_cohort_tumor_clf(
         if lambda_l1_node_importances is not None:
             for ni in model[0].node_importances:
                 loss += lambda_l1_node_importances * torch.sum(torch.abs(ni)) / ni.size()[0]
+
+        aux_loss = get_diffpool_aux_losses(model, lambda_link_pred, lambda_entropy)
+        loss = loss + aux_loss
 
         loss.backward()
         optimizer.step()

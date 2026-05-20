@@ -81,6 +81,7 @@ def train_and_validate_model(
     args,
     n_levels=1,
     random_state=123,
+    rep=0,
     indices_loader: PCRunIndicesLoader | None = None
 ):
     print("HELLO TUNING")
@@ -192,6 +193,32 @@ def train_and_validate_model(
             print("-- Train loss: {:.4f}".format(train_loss))
             print("-- Train accuracy: {:.4f}".format(train_accuracy))
             print("-- Validation Metrics: {}".format(validation_metrics))
+
+    if not using_ray_tune:
+        test_loader = build_data_loaders(
+            test_set, batch_size=batch_size, num_workers=num_workers, device=device
+        )[0]
+        test_metrics, (test_outputs, test_labels) = evaluate_clf(
+            model=model, validation_loader=test_loader, device=device,
+            loss_fn=loss_fn, return_outputs=True,
+        )
+        print("-- Test metrics: {}".format(test_metrics))
+
+        path_experiment = (
+            Path(args.path_output)
+            / f"nlevels{n_levels}_rep{rep}_wpool{weighted_pooling}_convs{use_convs}"
+        )
+        analyze_final_model_results(
+            pd.DataFrame({
+                "epoch": [0], "train_loss": [train_loss],
+                "train_accuracy": [train_accuracy],
+                "test_loss": [test_metrics["loss"]],
+                "test_accuracy": [test_metrics["accuracy"]],
+                "test_balanced_accuracy": [test_metrics["balanced_accuracy"]],
+            }),
+            test_outputs, test_labels, hp_config, path_experiment,
+            dataset.label_encoder.classes_, model=model,
+        )
 
 
 def parse_args():
@@ -550,9 +577,10 @@ def run_holdout(args, random_state, rep):
                         args=args,
                         n_levels=n_levels,
                         random_state=random_state,
+                        rep=rep,
                         indices_loader=indices_loader
                     )
-                    return
+                    continue
 
                 path_ray = path_experiment / "ray_results"
                 scheduler = ASHAScheduler(

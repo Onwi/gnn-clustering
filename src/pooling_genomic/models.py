@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Union, List, Tuple
+from typing import Union, List, Tuple, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -7,7 +7,7 @@ import torch.nn as nn
 import networkx as nx
 from torch_geometric.nn import global_mean_pool
 from torch_geometric.nn.conv import ChebConv
-from torch_geometric.utils import from_networkx
+from torch_geometric.utils import from_networkx, to_dense_adj, dense_to_sparse
 from torch_geometric.nn import GCNConv
 from torch_geometric.data import Data
 from torch_scatter import scatter
@@ -388,6 +388,292 @@ def build_coarsening_model(
             **kwargs,
         )
         return model
+
+
+class DiffPoolLayer(nn.Module):
+    """A single differentiable pooling layer (DiffPool-style).
+
+    Learns a soft assignment matrix S that clusters N nodes into K super-nodes.
+    Two modes:
+      - hybrid:  keeps pre-computed coarse edges for the next level
+                 (identity message passing, learned clustering only)
+      - full:    pools adjacency via S^T A S and extracts sparse edges back
+
+    Parameters
+    ----------
+    in_channels : int
+    hidden_channels : int
+    max_clusters : int
+        Upper bound on the number of clusters this layer can produce.
+    K : int
+        Chebyshev filter order.
+    """
+    def __init__(self, in_channels: int, hidden_channels: int, max_clusters: int, K: int = 2, passthrough: bool = False):
+        super().__init__()
+        self.embed_gnn = ChebConv(in_channels, hidden_channels, K=K)
+        self.pool_gnn = ChebConv(in_channels, max_clusters, K=K)
+        self.logit_pool_ratio = nn.Parameter(torch.tensor(0.0))
+        self._coarse_edge_index: Optional[torch.Tensor] = None
+        self._coarse_edge_weight: Optional[torch.Tensor] = None
+        self._parents: Optional[torch.Tensor] = None
+        self.passthrough = passthrough
+
+    def set_coarse_edges(self, edge_index: torch.Tensor, edge_weight: torch.Tensor, parents: Optional[torch.Tensor] = None):
+        self._coarse_edge_index = edge_index
+        self._coarse_edge_weight = edge_weight
+        self._parents = parents
+
+    @property
+    def pool_ratio(self) -> torch.Tensor:
+        return torch.sigmoid(self.logit_pool_ratio)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_weight: torch.Tensor,
+        min_nodes: int = 2,
+    ):
+        """Forward pass.
+
+        Returns
+        -------
+        x_next : (batch, k, hidden_channels)
+        edge_index_next : (2, e)
+        edge_weight_next : (e,)
+        aux : dict with keys 'link_pred_loss', 'entropy_loss'
+        """
+        batch_size, n, _ = x.shape
+
+        # Embed features with message passing
+        z = F.relu(self.embed_gnn(x, edge_index, edge_weight=edge_weight))
+
+        # --- Last layer: preserve all nodes for flatten (match HEM) ---
+        if self.passthrough:
+            aux = {'link_pred_loss': 0.0, 'entropy_loss': 0.0}
+            return z, edge_index, edge_weight, aux
+
+        # --- Hybrid mode with pre-computed HEM parents ---
+        if self._parents is not None:
+            # Efficient scatter-based pooling (no learned assignments)
+            x_next = scatter(z, self._parents, dim=1, reduce='mean')
+            aux = {'link_pred_loss': 0.0, 'entropy_loss': 0.0}
+            return x_next, self._coarse_edge_index, self._coarse_edge_weight, aux
+
+        # --- Full mode: learn soft assignments via pool_gnn ---
+        ratio = self.pool_ratio
+        k_raw = int(torch.ceil(torch.tensor(n, dtype=torch.float) * ratio).item())
+        k = max(min_nodes, min(k_raw, self.pool_gnn.out_channels))
+
+        s_raw = self.pool_gnn(x, edge_index, edge_weight=edge_weight)
+        S = F.softmax(s_raw[:, :, :k], dim=-1)
+
+        # Pool features: X' = S^T Z
+        x_next = torch.bmm(S.transpose(1, 2), z)
+
+        # --- auxiliary losses ---
+        A_dense = to_dense_adj(edge_index, edge_attr=edge_weight)  # (1, n, n)
+        A_dense = A_dense.squeeze(0)
+
+        S_mean = S.mean(dim=0)
+        SSt = S_mean @ S_mean.t()
+        link_pred_loss = F.mse_loss(
+            A_dense / (A_dense.norm(p='fro') + 1e-8),
+            SSt / (SSt.norm(p='fro') + 1e-8),
+        )
+
+        S_entropy = -(S * torch.log(S.clamp(min=1e-8))).sum(dim=-1).mean()
+
+        aux = {
+            'link_pred_loss': link_pred_loss,
+            'entropy_loss': S_entropy,
+        }
+
+        # --- output graph (full mode: extract sparse edges from pooled adjacency) ---
+        A_next_dense = torch.bmm(
+            S.transpose(1, 2),
+            torch.bmm(
+                A_dense.unsqueeze(0).expand(batch_size, -1, -1),
+                S,
+            ),
+        )
+        A_mean = A_next_dense.mean(dim=0)
+        A_mean = A_mean * (1 - torch.eye(k, device=A_mean.device))
+        edge_index_next, edge_weight_next = dense_to_sparse(A_mean)
+
+        return x_next, edge_index_next, edge_weight_next, aux
+
+
+def _compute_channel_list(n_levels: int, max_filters: int = 32):
+    """Progressive channel sizes matching the original model: 1,2,4,...,max_filters."""
+    channels = []
+    for i in range(n_levels):
+        in_ch = min(2 ** i, max_filters)
+        out_ch = min(2 ** (i + 1), max_filters)
+        channels.append((in_ch, out_ch))
+    return channels
+
+
+class DiffPoolGNN(nn.Module):
+    """Hierarchical pooling GNN with learnable cluster assignments.
+
+    Architecture:
+      - A series of DiffPoolLayer blocks with progressively growing channels.
+      - Early layers use *hybrid* mode (learned S, fixed coarse edges).
+      - Later layers use *full* mode (learned S + pooled dense adjacency).
+      - Global mean pooling over the final-level nodes → fixed-size vector.
+    """
+    def __init__(
+        self,
+        base_edge_index: torch.Tensor,
+        base_edge_weight: torch.Tensor,
+        coarse_edges: List,
+        n_hybrid: int,
+        parents_list: Optional[List] = None,
+        max_filters: int = 32,
+        max_clusters: int = 32,
+        dense_threshold: int = 500,
+        K: int = 2,
+    ):
+        super().__init__()
+        self.dense_threshold = dense_threshold
+        self.max_filters = max_filters
+
+        self.register_buffer('base_edge_index', base_edge_index)
+        self.register_buffer('base_edge_weight', base_edge_weight)
+
+        n_levels = n_hybrid + 1
+        channels = _compute_channel_list(n_levels, max_filters)
+
+        if parents_list is None:
+            parents_list = []
+
+        self.diffpool_layers = nn.ModuleList()
+        for i in range(n_levels):
+            in_ch, out_ch = channels[i]
+            layer = DiffPoolLayer(
+                in_channels=in_ch,
+                hidden_channels=out_ch,
+                max_clusters=max_clusters,
+                K=K,
+                passthrough=(i == n_levels - 1),
+            )
+            if i < n_hybrid and i + 1 < len(coarse_edges):
+                ei, ew = coarse_edges[i + 1]
+                parents = parents_list[i] if i < len(parents_list) else None
+                layer.set_coarse_edges(ei, ew, parents=parents)
+            self.diffpool_layers.append(layer)
+
+    def forward(self, X: torch.Tensor):
+        num_samples, num_features = X.shape
+        H = torch.reshape(X, (num_samples, num_features, 1))
+
+        edge_index = self.base_edge_index
+        edge_weight = self.base_edge_weight
+        aux_records = []
+
+        for lvl, layer in enumerate(self.diffpool_layers):
+            n_nodes = H.size(1)
+
+            # Switch from hybrid to full mode when graph is small enough
+            if n_nodes <= self.dense_threshold and layer._coarse_edge_index is not None:
+                layer._coarse_edge_index = None
+                layer._coarse_edge_weight = None
+                layer._parents = None
+
+            H, edge_index, edge_weight, aux = layer(H, edge_index, edge_weight)
+            aux_records.append(aux)
+
+        # Flatten all nodes × channels (like HEM does)
+        H = H.reshape(H.size(0), -1)
+
+        self._aux_records = aux_records
+        return H
+
+
+def build_diffpool_model(
+    base_graph: Data,
+    coarse_edges: List,
+    output_dims: int,
+    n_hybrid: int = 2,
+    parents_list: Optional[List] = None,
+    max_filters: int = 32,
+    max_clusters: int = 32,
+    dense_threshold: int = 500,
+    mlp_hidden_dim: Union[int, Tuple[int, ...]] = (256,),
+    mlp_dropout: float = 0.5,
+    K: int = 2,
+    **kwargs,
+):
+    """Build a DiffPool-based classifier.
+
+    Parameters
+    ----------
+    base_graph : Data
+        The original gene graph with ``.edge_index`` and ``.edge_weight``.
+    coarse_edges : List of (edge_index, edge_weight)
+        Pre-computed coarse edges for each hybrid level.
+    output_dims : int
+        Number of output classes.
+    n_hybrid : int
+        Number of early levels that use hybrid mode (fixed coarse edges).
+    parents_list : List of Tensor, optional
+        Pre-computed HEM parent mappings for each level. If provided, hybrid
+        levels use efficient scatter pooling instead of learned assignments.
+    max_filters : int
+        Maximum feature dimension (grows progressively: 1,2,4,...,max_filters).
+    max_clusters : int
+        Maximum clusters per DiffPoolLayer.
+    dense_threshold : int
+        Node count below which we switch from hybrid to full mode.
+    mlp_hidden_dim : int or tuple
+    mlp_dropout : float
+    K : int
+        Chebyshev filter order.
+    """
+    gnn_model = DiffPoolGNN(
+        base_edge_index=base_graph.edge_index,
+        base_edge_weight=base_graph.edge_weight,
+        coarse_edges=coarse_edges,
+        n_hybrid=n_hybrid,
+        parents_list=parents_list,
+        max_filters=max_filters,
+        max_clusters=max_clusters,
+        dense_threshold=dense_threshold,
+        K=K,
+    )
+
+    # Determine final node count for flattening (like HEM)
+    if n_hybrid > 0 and parents_list and len(parents_list) >= n_hybrid:
+        # Last hybrid level's parent mapping gives the final node count
+        num_super_nodes = parents_list[n_hybrid - 1].unique().numel()
+    else:
+        # No hybrid levels: use base graph node count
+        num_super_nodes = base_graph.num_nodes
+
+    last_channels = min(2 ** (n_hybrid + 1), max_filters)
+    mlp_input_dim = num_super_nodes * last_channels
+
+    mlp_model = FCModel(
+        input_dim=mlp_input_dim,
+        output_dim=output_dims,
+        hidden_dim=mlp_hidden_dim,
+        dropout=mlp_dropout,
+    )
+
+    clf = nn.Sequential(gnn_model, mlp_model)
+    return clf
+
+
+def get_diffpool_aux_losses(model: nn.Module, lambda_link_pred: float, lambda_entropy: float):
+    """Extract and sum auxiliary losses from a DiffPoolGNN inside a Sequential."""
+    for module in model.modules():
+        if isinstance(module, DiffPoolGNN) and hasattr(module, '_aux_records'):
+            records = module._aux_records
+            link_loss = sum(r['link_pred_loss'] for r in records)
+            ent_loss = sum(r['entropy_loss'] for r in records)
+            return lambda_link_pred * link_loss + lambda_entropy * ent_loss
+    return 0.0
 
 
 class CohortAndTumorLoss(nn.Module):
