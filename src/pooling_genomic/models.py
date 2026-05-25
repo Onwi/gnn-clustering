@@ -408,7 +408,7 @@ class DiffPoolLayer(nn.Module):
     K : int
         Chebyshev filter order.
     """
-    def __init__(self, in_channels: int, hidden_channels: int, max_clusters: int, K: int = 2, passthrough: bool = False):
+    def __init__(self, in_channels: int, hidden_channels: int, max_clusters: int, K: int = 2):
         super().__init__()
         self.embed_gnn = ChebConv(in_channels, hidden_channels, K=K)
         self.pool_gnn = ChebConv(in_channels, max_clusters, K=K)
@@ -416,7 +416,6 @@ class DiffPoolLayer(nn.Module):
         self._coarse_edge_index: Optional[torch.Tensor] = None
         self._coarse_edge_weight: Optional[torch.Tensor] = None
         self._parents: Optional[torch.Tensor] = None
-        self.passthrough = passthrough
 
     def set_coarse_edges(self, edge_index: torch.Tensor, edge_weight: torch.Tensor, parents: Optional[torch.Tensor] = None):
         self._coarse_edge_index = edge_index
@@ -447,11 +446,6 @@ class DiffPoolLayer(nn.Module):
 
         # Embed features with message passing
         z = F.relu(self.embed_gnn(x, edge_index, edge_weight=edge_weight))
-
-        # --- Last layer: preserve all nodes for flatten (match HEM) ---
-        if self.passthrough:
-            aux = {'link_pred_loss': 0.0, 'entropy_loss': 0.0}
-            return z, edge_index, edge_weight, aux
 
         # --- Hybrid mode with pre-computed HEM parents ---
         if self._parents is not None:
@@ -517,48 +511,60 @@ def _compute_channel_list(n_levels: int, max_filters: int = 32):
 class DiffPoolGNN(nn.Module):
     """Hierarchical pooling GNN with learnable cluster assignments.
 
-    Architecture:
-      - A series of DiffPoolLayer blocks with progressively growing channels.
-      - Early layers use *hybrid* mode (learned S, fixed coarse edges).
-      - Later layers use *full* mode (learned S + pooled dense adjacency).
-      - Global mean pooling over the final-level nodes → fixed-size vector.
+    Two modes:
+
+    **Hybrid mode** (``full_mode=False``, default):
+      Early layers use pre-computed HEM coarse edges + parent-based scatter
+      pooling. Later layers switch to full learned DiffPool when the number
+      of nodes drops below ``dense_threshold``.  The number of layers is
+      ``n_hybrid + 1``.
+
+    **Full mode** (``full_mode=True``):
+      Every layer learns its own soft-assignment matrix ``S`` via
+      ``pool_gnn`` and pools features/adjacency as ``X' = S^T Z``,
+      ``A' = S^T A S``.  No pre-computed coarse edges are needed.
+      The number of layers is given by ``n_levels``.
     """
     def __init__(
         self,
         base_edge_index: torch.Tensor,
         base_edge_weight: torch.Tensor,
-        coarse_edges: List,
-        n_hybrid: int,
+        coarse_edges: Optional[List] = None,
+        n_hybrid: int = 2,
         parents_list: Optional[List] = None,
         max_filters: int = 32,
         max_clusters: int = 32,
         dense_threshold: int = 500,
         K: int = 2,
+        full_mode: bool = False,
+        n_levels: Optional[int] = None,
     ):
         super().__init__()
-        self.dense_threshold = dense_threshold
         self.max_filters = max_filters
 
         self.register_buffer('base_edge_index', base_edge_index)
         self.register_buffer('base_edge_weight', base_edge_weight)
 
-        n_levels = n_hybrid + 1
-        channels = _compute_channel_list(n_levels, max_filters)
+        if full_mode:
+            levels = n_levels if n_levels is not None else 3
+        else:
+            levels = n_hybrid + 1
+
+        channels = _compute_channel_list(levels, max_filters)
 
         if parents_list is None:
             parents_list = []
 
         self.diffpool_layers = nn.ModuleList()
-        for i in range(n_levels):
+        for i in range(levels):
             in_ch, out_ch = channels[i]
             layer = DiffPoolLayer(
                 in_channels=in_ch,
                 hidden_channels=out_ch,
                 max_clusters=max_clusters,
                 K=K,
-                passthrough=(i == n_levels - 1),
             )
-            if i < n_hybrid and i + 1 < len(coarse_edges):
+            if not full_mode and i < n_hybrid and coarse_edges is not None and i + 1 < len(coarse_edges):
                 ei, ew = coarse_edges[i + 1]
                 parents = parents_list[i] if i < len(parents_list) else None
                 layer.set_coarse_edges(ei, ew, parents=parents)
@@ -572,19 +578,10 @@ class DiffPoolGNN(nn.Module):
         edge_weight = self.base_edge_weight
         aux_records = []
 
-        for lvl, layer in enumerate(self.diffpool_layers):
-            n_nodes = H.size(1)
-
-            # Switch from hybrid to full mode when graph is small enough
-            if n_nodes <= self.dense_threshold and layer._coarse_edge_index is not None:
-                layer._coarse_edge_index = None
-                layer._coarse_edge_weight = None
-                layer._parents = None
-
+        for layer in self.diffpool_layers:
             H, edge_index, edge_weight, aux = layer(H, edge_index, edge_weight)
             aux_records.append(aux)
 
-        # Flatten all nodes × channels (like HEM does)
         H = H.reshape(H.size(0), -1)
 
         self._aux_records = aux_records
@@ -593,8 +590,8 @@ class DiffPoolGNN(nn.Module):
 
 def build_diffpool_model(
     base_graph: Data,
-    coarse_edges: List,
     output_dims: int,
+    coarse_edges: Optional[List] = None,
     n_hybrid: int = 2,
     parents_list: Optional[List] = None,
     max_filters: int = 32,
@@ -603,6 +600,8 @@ def build_diffpool_model(
     mlp_hidden_dim: Union[int, Tuple[int, ...]] = (256,),
     mlp_dropout: float = 0.5,
     K: int = 2,
+    full_mode: bool = False,
+    n_levels: Optional[int] = None,
     **kwargs,
 ):
     """Build a DiffPool-based classifier.
@@ -611,25 +610,34 @@ def build_diffpool_model(
     ----------
     base_graph : Data
         The original gene graph with ``.edge_index`` and ``.edge_weight``.
-    coarse_edges : List of (edge_index, edge_weight)
-        Pre-computed coarse edges for each hybrid level.
     output_dims : int
         Number of output classes.
+    coarse_edges : List of (edge_index, edge_weight), optional
+        Pre-computed coarse edges for hybrid levels.  Required when
+        ``full_mode=False``.
     n_hybrid : int
-        Number of early levels that use hybrid mode (fixed coarse edges).
+        Number of early levels that use hybrid mode.  Only used when
+        ``full_mode=False``.  In full mode this is ignored in favour of
+        ``n_levels``.
     parents_list : List of Tensor, optional
-        Pre-computed HEM parent mappings for each level. If provided, hybrid
-        levels use efficient scatter pooling instead of learned assignments.
+        Pre-computed HEM parent mappings for each hybrid level.
     max_filters : int
         Maximum feature dimension (grows progressively: 1,2,4,...,max_filters).
     max_clusters : int
-        Maximum clusters per DiffPoolLayer.
+        Maximum clusters per DiffPoolLayer.  The final layer always pools
+        to at most this many nodes.
     dense_threshold : int
-        Node count below which we switch from hybrid to full mode.
+        Node count below which hybrid mode switches to full mode
+        (only used when ``full_mode=False``).
     mlp_hidden_dim : int or tuple
     mlp_dropout : float
     K : int
         Chebyshev filter order.
+    full_mode : bool
+        When True, every DiffPoolLayer uses learned assignments
+        (no pre-computed coarse edges / HEM parents).
+    n_levels : int, optional
+        Number of DiffPool layers when ``full_mode=True``.
     """
     gnn_model = DiffPoolGNN(
         base_edge_index=base_graph.edge_index,
@@ -641,18 +649,18 @@ def build_diffpool_model(
         max_clusters=max_clusters,
         dense_threshold=dense_threshold,
         K=K,
+        full_mode=full_mode,
+        n_levels=n_levels,
     )
 
-    # Determine final node count for flattening (like HEM)
-    if n_hybrid > 0 and parents_list and len(parents_list) >= n_hybrid:
-        # Last hybrid level's parent mapping gives the final node count
-        num_super_nodes = parents_list[n_hybrid - 1].unique().numel()
+    if full_mode:
+        levels = n_levels if n_levels is not None else 3
     else:
-        # No hybrid levels: use base graph node count
-        num_super_nodes = base_graph.num_nodes
+        levels = n_hybrid + 1
 
-    last_channels = min(2 ** (n_hybrid + 1), max_filters)
-    mlp_input_dim = num_super_nodes * last_channels
+    # Last layer always pools to max_clusters nodes → flatten
+    last_channels = min(2 ** levels, max_filters)
+    mlp_input_dim = max_clusters * last_channels
 
     mlp_model = FCModel(
         input_dim=mlp_input_dim,

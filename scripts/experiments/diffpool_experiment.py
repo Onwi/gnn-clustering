@@ -30,7 +30,8 @@ def build_data_loaders(*args, batch_size, num_workers, device='cpu'):
             shuffle=True,
             num_workers=num_workers,
             drop_last=drop_last,
-            pin_memory=pin_memory
+            pin_memory=pin_memory,
+            multiprocessing_context='spawn' if num_workers > 0 else None,
         )
         loaders.append(dataset_loader)
     return tuple(loaders)
@@ -49,10 +50,10 @@ def build_hp_config(args):
         }
     else:
         hp_config = {
-            "lr": 0.05,
-            "weight_decay": 0.01,
-            "lambda_link_pred": 0.001,
-            "lambda_entropy": 0.001,
+            "lr": args.lr if args.lr is not None else 0.05,
+            "weight_decay": args.weight_decay if args.weight_decay is not None else 0.01,
+            "lambda_link_pred": args.lambda_link_pred if args.lambda_link_pred is not None else 0.001,
+            "lambda_entropy": args.lambda_entropy if args.lambda_entropy is not None else 0.001,
             "eta_min": 0.00001,
             "T_0": 1,
             "T_mult": 2,
@@ -77,6 +78,7 @@ def train_and_validate_model(
     max_epochs = args.max_epochs
     n_cycles = max(args.n_cycles - 1, 1)
     using_ray_tune = args.tune
+    full_mode = args.full_mode
 
     lr = hp_config["lr"]
     weight_decay = hp_config["weight_decay"]
@@ -105,10 +107,14 @@ def train_and_validate_model(
     base_graph = get_pyg_data(genes=genes, path_to_csv=path_network)
     base_graph = base_graph.to(device)
 
-    max_levels = args.max_n_levels
-    coarse_edges, parents_list = load_coarse_edges_for_diffpool(
-        path_levels=path_levels, n_levels=max_levels, device=device
-    )
+    if full_mode:
+        coarse_edges = None
+        parents_list = None
+    else:
+        max_levels = args.max_n_levels
+        coarse_edges, parents_list = load_coarse_edges_for_diffpool(
+            path_levels=path_levels, n_levels=max_levels, device=device
+        )
 
     if n_cycles is not None:
         max_epochs = int(T_0 * (1 - T_mult**n_cycles) / (1 - T_mult))
@@ -122,6 +128,8 @@ def train_and_validate_model(
         max_filters=args.max_filters,
         max_clusters=args.max_clusters,
         dense_threshold=args.dense_threshold,
+        full_mode=full_mode,
+        n_levels=n_hybrid,
     )
     model = model.to(device=device)
 
@@ -190,9 +198,10 @@ def train_and_validate_model(
         )
         print("-- Test metrics: {}".format(test_metrics))
 
+        mode_tag = "full" if args.full_mode else "hybrid"
         path_experiment = (
             Path(args.path_output)
-            / f"diffpool_hybrid{n_hybrid}_rep{rep}"
+            / f"diffpool_{mode_tag}{n_hybrid}_rep{rep}"
         )
         analyze_final_model_results(
             pd.DataFrame({
@@ -219,7 +228,9 @@ def parse_args():
 
     parser.add_argument("--max-n-levels", type=int, default=8)
     parser.add_argument("--n-hybrid", type=int, default=2,
-                        help="Number of early levels that use hybrid mode (fixed coarse edges)")
+                        help="Number of early levels that use hybrid mode (max n_hybrid to try)")
+    parser.add_argument("--n-hybrid-start", type=int, default=0,
+                        help="First n_hybrid value to try (for partial runs)")
     parser.add_argument("--max-filters", type=int, default=32,
                         help="Maximum feature dimension (grows progressivly: 1,2,4,...,max_filters)")
     parser.add_argument("--max-clusters", type=int, default=32,
@@ -227,9 +238,21 @@ def parse_args():
     parser.add_argument("--dense-threshold", type=int, default=500,
                         help="Node count below which full mode (dense adjacency pooling) is used")
 
+    parser.add_argument("--full-mode", action="store_true",
+                        help="Use full DiffPool everywhere (no hybrid levels, no HEM coarse edges)")
+
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--tune", action="store_true")
     parser.add_argument("--debug", action="store_true")
+
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Override learning rate (non-tuning only)")
+    parser.add_argument("--weight-decay", type=float, default=None,
+                        help="Override weight_decay (non-tuning only)")
+    parser.add_argument("--lambda-link-pred", type=float, default=None,
+                        help="Override lambda_link_pred (non-tuning only)")
+    parser.add_argument("--lambda-entropy", type=float, default=None,
+                        help="Override lambda_entropy (non-tuning only)")
 
     parser.add_argument("--cpu-per-trial", type=float, default=1)
     parser.add_argument("--gpu-per-trial", type=float, default=0.1)
@@ -293,6 +316,7 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
     max_epochs = args.max_epochs
     n_cycles = args.n_cycles
     metadata_column = args.metadata_column
+    full_mode = args.full_mode
 
     dataset_kwargs = dict(return_original_set=True, random_state=random_state)
     if metadata_column is not None:
@@ -312,10 +336,14 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
     base_graph = get_pyg_data(genes=genes, path_to_csv=path_network)
     base_graph = base_graph.to(device)
 
-    max_levels = args.max_n_levels
-    coarse_edges, parents_list = load_coarse_edges_for_diffpool(
-        path_levels=path_levels, n_levels=max_levels, device=device
-    )
+    if full_mode:
+        coarse_edges = None
+        parents_list = None
+    else:
+        max_levels = args.max_n_levels
+        coarse_edges, parents_list = load_coarse_edges_for_diffpool(
+            path_levels=path_levels, n_levels=max_levels, device=device
+        )
 
     best_result = results.get_best_result(scope="last")
     config = best_result.config
@@ -333,6 +361,8 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
         max_filters=args.max_filters,
         max_clusters=args.max_clusters,
         dense_threshold=args.dense_threshold,
+        full_mode=full_mode,
+        n_levels=n_hybrid,
     )
     model = model.to(device=device)
 
@@ -466,11 +496,12 @@ def run_holdout(args, random_state, rep):
     else:
         indices_loader = None
 
-    for n_hybrid in range(0, min(args.max_n_levels, args.n_hybrid + 1)):
+    mode_tag = "full" if args.full_mode else "hybrid"
+    for n_hybrid in range(args.n_hybrid_start, min(args.max_n_levels, args.n_hybrid + 1)):
         hp_config = build_hp_config(args)
         path_experiment = (
             Path(args.path_output)
-            / f"diffpool_hybrid{n_hybrid}_rep{rep}"
+            / f"diffpool_{mode_tag}{n_hybrid}_rep{rep}"
         )
         if path_experiment.exists():
             print(f"Path {path_experiment} already exists. Skipping")
@@ -478,11 +509,19 @@ def run_holdout(args, random_state, rep):
         print(f"Path {path_experiment} does not exist.")
 
         if not args.tune:
-            train_and_validate_model(
-                hp_config=hp_config, args=args, n_hybrid=n_hybrid,
-                random_state=random_state, rep=rep,
-                indices_loader=indices_loader
-            )
+            try:
+                train_and_validate_model(
+                    hp_config=hp_config, args=args, n_hybrid=n_hybrid,
+                    random_state=random_state, rep=rep,
+                    indices_loader=indices_loader
+                )
+            except RuntimeError as e:
+                if 'out of memory' in str(e).lower() or 'cuda' in str(e).lower():
+                    print(f"OOM for n_hybrid={n_hybrid}, skipping: {e}")
+                    if 'cuda' in args.device:
+                        torch.cuda.empty_cache()
+                else:
+                    raise
             continue
 
         path_ray = path_experiment / "ray_results"
