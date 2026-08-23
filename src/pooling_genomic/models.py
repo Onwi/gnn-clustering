@@ -1,4 +1,5 @@
 from functools import partial
+import math
 from typing import Union, List, Tuple, Optional
 import numpy as np
 import torch
@@ -484,13 +485,19 @@ class DiffPoolLayer(nn.Module):
         }
 
         # --- output graph (full mode: extract sparse edges from pooled adjacency) ---
-        A_next_dense = torch.bmm(
-            S.transpose(1, 2),
-            torch.bmm(
-                A_dense.unsqueeze(0).expand(batch_size, -1, -1),
-                S,
-            ),
-        )
+        # The base topology (edge_index/edge_weight) is identical for every sample in
+        # the batch -- only S varies per sample -- so `A @ S` never needs a dense
+        # (n, n) copy of A, let alone one expanded per batch item. We compute `A @ S`
+        # per sample via a sparse-dense matmul (each is O(nnz * k) instead of O(n^2)),
+        # writing directly into a preallocated output tensor: a Python list/stack here
+        # would keep every per-sample result alive at once, doubling peak memory for no
+        # reason. Only the small (batch, k, k) `S^T @ (A @ S)` product uses a dense bmm.
+        A_sparse = torch.sparse_coo_tensor(edge_index, edge_weight, size=(n, n)).coalesce()
+        AS = torch.empty(batch_size, n, k, device=x.device, dtype=S.dtype)
+        for b in range(batch_size):
+            AS[b] = torch.sparse.mm(A_sparse, S[b])
+
+        A_next_dense = torch.bmm(S.transpose(1, 2), AS)             # (batch, k, k)
         A_mean = A_next_dense.mean(dim=0)
         A_mean = A_mean * (1 - torch.eye(k, device=A_mean.device))
         edge_index_next, edge_weight_next = dense_to_sparse(A_mean)
@@ -508,6 +515,38 @@ def _compute_channel_list(n_levels: int, max_filters: int = 32):
     return channels
 
 
+def _compute_cluster_schedule(n_start: int, n_final: int, levels: int) -> List[int]:
+    """Geometrically-spaced per-level cluster-count targets.
+
+    Without this, every ``DiffPoolLayer`` in full mode caps its output at the
+    same global ``max_clusters`` (since ``pool_gnn.out_channels`` bounds
+    ``k``), so the very first layer collapses ``n_start`` nodes straight down
+    to ``max_clusters`` in one hop regardless of how many levels are
+    configured. This spreads that compression geometrically across levels,
+    e.g. 14000 -> 670 -> 32 instead of 14000 -> 32 -> 32.
+
+    Returns a list of length ``levels``, strictly decreasing, ending exactly
+    at ``n_final``.
+    """
+    if levels <= 0:
+        return []
+    if levels == 1 or n_start <= n_final:
+        return [n_final] * levels
+
+    log_start, log_final = math.log(n_start), math.log(n_final)
+    schedule = []
+    prev = n_start
+    for i in range(1, levels + 1):
+        frac = i / levels
+        target = round(math.exp(log_start + (log_final - log_start) * frac))
+        # keep strictly decreasing and never below the final target
+        target = max(n_final, min(target, prev - 1))
+        schedule.append(target)
+        prev = target
+    schedule[-1] = n_final
+    return schedule
+
+
 class DiffPoolGNN(nn.Module):
     """Hierarchical pooling GNN with learnable cluster assignments.
 
@@ -523,7 +562,11 @@ class DiffPoolGNN(nn.Module):
       Every layer learns its own soft-assignment matrix ``S`` via
       ``pool_gnn`` and pools features/adjacency as ``X' = S^T Z``,
       ``A' = S^T A S``.  No pre-computed coarse edges are needed.
-      The number of layers is given by ``n_levels``.
+      The number of layers is given by ``n_levels``.  When ``n_nodes`` is
+      given and there is more than one level, each layer's cluster budget is
+      spread geometrically from ``n_nodes`` down to ``max_clusters`` (see
+      ``_compute_cluster_schedule``) instead of every layer collapsing to
+      ``max_clusters`` in a single hop.
     """
     def __init__(
         self,
@@ -538,6 +581,7 @@ class DiffPoolGNN(nn.Module):
         K: int = 2,
         full_mode: bool = False,
         n_levels: Optional[int] = None,
+        n_nodes: Optional[int] = None,
     ):
         super().__init__()
         self.max_filters = max_filters
@@ -552,6 +596,12 @@ class DiffPoolGNN(nn.Module):
 
         channels = _compute_channel_list(levels, max_filters)
 
+        if full_mode and levels > 1 and n_nodes is not None:
+            cluster_schedule = _compute_cluster_schedule(n_nodes, max_clusters, levels)
+        else:
+            cluster_schedule = [max_clusters] * levels
+        self.cluster_schedule = cluster_schedule
+
         if parents_list is None:
             parents_list = []
 
@@ -561,7 +611,7 @@ class DiffPoolGNN(nn.Module):
             layer = DiffPoolLayer(
                 in_channels=in_ch,
                 hidden_channels=out_ch,
-                max_clusters=max_clusters,
+                max_clusters=cluster_schedule[i],
                 K=K,
             )
             if not full_mode and i < n_hybrid and coarse_edges is not None and i + 1 < len(coarse_edges):
@@ -637,7 +687,11 @@ def build_diffpool_model(
         When True, every DiffPoolLayer uses learned assignments
         (no pre-computed coarse edges / HEM parents).
     n_levels : int, optional
-        Number of DiffPool layers when ``full_mode=True``.
+        Number of DiffPool layers when ``full_mode=True``.  When there is
+        more than one level, per-layer cluster budgets are spread
+        geometrically from ``base_graph.num_nodes`` down to ``max_clusters``
+        instead of every layer collapsing to ``max_clusters`` in one hop
+        (see ``DiffPoolGNN`` / ``_compute_cluster_schedule``).
     """
     gnn_model = DiffPoolGNN(
         base_edge_index=base_graph.edge_index,
@@ -651,6 +705,7 @@ def build_diffpool_model(
         K=K,
         full_mode=full_mode,
         n_levels=n_levels,
+        n_nodes=base_graph.num_nodes,
     )
 
     if full_mode:

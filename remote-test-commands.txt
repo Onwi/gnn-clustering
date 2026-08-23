@@ -1,0 +1,100 @@
+Remote validation commands for fix #1 (cluster schedule) and fix #2 (sparse
+adjacency pooling) in Full DiffPool. See changes-from-claude.md for what
+these fixes do and what was already tested locally (small scale, 12 GB GPU).
+
+Run these IN ORDER from the repo root on the remote machine. Copy/paste
+section by section, or the whole file at once.
+
+============================================================
+0. ENVIRONMENT SETUP
+============================================================
+
+conda create -n pooling_genomic python=3.10 -y
+conda activate pooling_genomic
+conda install pytorch==1.12.1 torchvision torchaudio cudatoolkit=11.3 -c pytorch -y
+conda install pytorch-scatter -c pyg -y
+cd PoolingGNNsGenomic_dev-master
+pip install -r requirements.txt
+pip install -e .
+python scripts/experiments/coarsening_levels.py --help
+
+mkdir -p logs
+
+============================================================
+1. QUICK MEMORY/SPEED BENCHMARK (no dataset needed, seconds each)
+   Exercises the real DiffPoolGNN code directly on a synthetic graph sized
+   like the real STRING-DB graph (14,133 nodes / ~8.2M edges).
+   Output: stdout only -- redirected below into logs/ so it's not lost.
+============================================================
+
+git stash
+python dev/benchmark_pooling_memory.py --levels 1 2>&1 | tee logs/bench_baseline_levels1.log
+python dev/benchmark_pooling_memory.py --levels 2 2>&1 | tee logs/bench_baseline_levels2.log
+python dev/benchmark_pooling_memory.py --levels 3 2>&1 | tee logs/bench_baseline_levels3.log
+git stash pop
+
+python dev/benchmark_pooling_memory.py --levels 1 2>&1 | tee logs/bench_fix_levels1.log
+python dev/benchmark_pooling_memory.py --levels 2 2>&1 | tee logs/bench_fix_levels2.log
+python dev/benchmark_pooling_memory.py --levels 3 2>&1 | tee logs/bench_fix_levels3.log
+
+diff logs/bench_baseline_levels3.log logs/bench_fix_levels3.log
+
+============================================================
+2. FAST SMOKE TEST -- small example dataset (BRCA-only, real data/pipeline)
+   Output: outputs_fix_test_smoke/diffpool_full3_rep0/final_model_results/
+============================================================
+
+python scripts/experiments/diffpool_experiment.py \
+    "$(pwd)/data/example_data/tcga_brca_subtypes_classification" \
+    "$(pwd)/data/example_data/networks/levels" \
+    --path-network "$(pwd)/data/string_data/data/networks/stringdb_top100pc.csv" \
+    --full-mode --n-hybrid 3 --n-cycles 1 --path-output outputs_fix_test_smoke --device cuda \
+    2>&1 | tee logs/smoke_fix_test.log
+
+============================================================
+3. FULL PAN-CANCER DATASET -- the real test (14K nodes, 7,709 samples, 16 classes)
+   Output:
+     outputs_fix_test/diffpool_full3_rep0/final_model_results/
+     outputs_baseline_test/diffpool_full3_rep0/final_model_results/
+   Each final_model_results/ contains: metrics.csv, confusion_matrix.jpg/.pdf,
+   predictions.csv, outputs.csv, model_configs.json, final_model.pt
+============================================================
+
+--- with the fix (current working tree) ---
+
+python scripts/experiments/diffpool_experiment.py \
+    "$(pwd)/data/string_data/data/tcga_cohorts_and_tumor_classification" \
+    "$(pwd)/data/string_data/data/networks/levels_new" \
+    --path-network "$(pwd)/data/string_data/data/networks/stringdb_top100pc.csv" \
+    --full-mode --n-hybrid 3 --n-cycles 1 --path-output outputs_fix_test --device cuda \
+    2>&1 | tee logs/full_fix_test.log
+
+--- baseline (before the fix), same config ---
+
+git stash
+python scripts/experiments/diffpool_experiment.py \
+    "$(pwd)/data/string_data/data/tcga_cohorts_and_tumor_classification" \
+    "$(pwd)/data/string_data/data/networks/levels_new" \
+    --path-network "$(pwd)/data/string_data/data/networks/stringdb_top100pc.csv" \
+    --full-mode --n-hybrid 3 --n-cycles 1 --path-output outputs_baseline_test --device cuda \
+    2>&1 | tee logs/full_baseline_test.log
+git stash pop
+
+--- compare ---
+
+diff <(cat outputs_baseline_test/diffpool_full3_rep0/final_model_results/metrics.csv) \
+     <(cat outputs_fix_test/diffpool_full3_rep0/final_model_results/metrics.csv)
+
+============================================================
+4. FULLER TUNED RUN (optional -- matches the scale used in plan.md)
+   Output: outputs_fix_test/diffpool_full3_rep0/final_model_results/
+           outputs_fix_test/diffpool_full3_rep0/ray_results/   (Ray Tune trial logs)
+============================================================
+
+python scripts/experiments/diffpool_experiment.py \
+    "$(pwd)/data/string_data/data/tcga_cohorts_and_tumor_classification" \
+    "$(pwd)/data/string_data/data/networks/levels_new" \
+    --path-network "$(pwd)/data/string_data/data/networks/stringdb_top100pc.csv" \
+    --full-mode --n-hybrid 3 --tune --n-cycles 5 --num-samples 8 \
+    --path-output outputs_fix_test --device cuda \
+    2>&1 | tee logs/full_fix_tuned.log
