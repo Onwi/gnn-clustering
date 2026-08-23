@@ -34,6 +34,7 @@ def get_genomic_classification_dataset(
             **kwargs
         )
     if 'tcga_cohorts_and_tumor_classification' in str(path_dataset):
+        kwargs['metadata_column'] = 'cohort'
         return get_tcga_classification_datasets(
             path_dataset=path_dataset,
             **kwargs

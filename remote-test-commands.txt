@@ -12,7 +12,18 @@ section by section, or the whole file at once.
 conda create -n pooling_genomic python=3.10 -y
 conda activate pooling_genomic
 conda install pytorch==1.12.1 torchvision torchaudio cudatoolkit=11.3 -c pytorch -y
-conda install pytorch-scatter -c pyg -y
+
+# Pin mkl/numpy right after the pytorch install. On a fresh env the defaults
+# channel resolves mkl to a version too new for torch 1.12.1's build, which
+# fails at import time with "undefined symbol: iJIT_NotifyEvent". This also
+# pulls numpy back to a version pandas/torch are actually ABI-compatible with.
+conda install "mkl=2021.4.0" -y
+
+# pyg = torch_geometric, imported throughout src/pooling_genomic (models.py,
+# networks.py) but not installable via pip in this setup -- must come from
+# the pyg conda channel, matched to the torch/cuda combo above.
+conda install pytorch-scatter pyg -c pyg -y
+
 cd PoolingGNNsGenomic_dev-master
 pip install -r requirements.txt
 pip install -e .

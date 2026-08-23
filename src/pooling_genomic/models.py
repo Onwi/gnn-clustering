@@ -594,6 +594,13 @@ class DiffPoolGNN(nn.Module):
         else:
             levels = n_hybrid + 1
 
+        if levels < 1:
+            raise ValueError(
+                f"DiffPoolGNN needs at least 1 pooling level, got levels={levels} "
+                f"(full_mode={full_mode}, n_levels={n_levels}, n_hybrid={n_hybrid}). "
+                "There is no valid zero-pooling architecture -- use n_hybrid/n_levels >= 1."
+            )
+
         channels = _compute_channel_list(levels, max_filters)
 
         if full_mode and levels > 1 and n_nodes is not None:

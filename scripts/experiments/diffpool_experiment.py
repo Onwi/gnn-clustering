@@ -497,7 +497,10 @@ def run_holdout(args, random_state, rep):
         indices_loader = None
 
     mode_tag = "full" if args.full_mode else "hybrid"
-    for n_hybrid in range(args.n_hybrid_start, min(args.max_n_levels, args.n_hybrid + 1)):
+    # full_mode has no valid n_hybrid=0 architecture (zero pooling levels) --
+    # skip it rather than let it crash deep in the model's forward pass.
+    n_hybrid_start = max(args.n_hybrid_start, 1) if args.full_mode else args.n_hybrid_start
+    for n_hybrid in range(n_hybrid_start, min(args.max_n_levels, args.n_hybrid + 1)):
         hp_config = build_hp_config(args)
         path_experiment = (
             Path(args.path_output)
