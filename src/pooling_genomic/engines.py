@@ -18,6 +18,7 @@ def train_epoch_clf(
     lambda_l1_node_importances: float = None,
     lambda_link_pred: float = 0.0,
     lambda_entropy: float = 0.0,
+    grad_clip_max_norm: float = 5.0,
 ):
     model.train()
 
@@ -42,6 +43,8 @@ def train_epoch_clf(
         loss = loss + aux_loss
 
         loss.backward()
+        if grad_clip_max_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_max_norm)
         optimizer.step()
 
         with torch.no_grad():

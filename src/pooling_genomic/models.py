@@ -505,14 +505,43 @@ class DiffPoolLayer(nn.Module):
         return x_next, edge_index_next, edge_weight_next, aux
 
 
-def _compute_channel_list(n_levels: int, max_filters: int = 32):
-    """Progressive channel sizes matching the original model: 1,2,4,...,max_filters."""
+def _compute_channel_list(n_levels: int, max_filters: int = 32, start_channels: int = 1):
+    """Progressive channel sizes: start_channels, 2*start_channels, ..., max_filters."""
     channels = []
     for i in range(n_levels):
-        in_ch = min(2 ** i, max_filters)
-        out_ch = min(2 ** (i + 1), max_filters)
+        in_ch = min(start_channels * 2 ** i, max_filters)
+        out_ch = min(start_channels * 2 ** (i + 1), max_filters)
         channels.append((in_ch, out_ch))
     return channels
+
+
+class PrePoolingEncoder(nn.Module):
+    """1D-Conv -> ChebConv encoder that enriches raw per-node scalar features
+    to ``encoder_channels`` dims before cluster-assignment learning.
+
+    Without this, Full DiffPool's first pooling layer has to learn cluster
+    assignments directly from a 1-dim raw expression value per node, which
+    plan.md's own ablation found collapses to near-random performance
+    (27.7%); adding this encoder alone recovers to 58.3% (5.3.3).
+    """
+    def __init__(self, encoder_channels: int = 16, encoder_layers: int = 2, K: int = 2):
+        super().__init__()
+        if encoder_layers < 2:
+            raise ValueError("encoder_layers must be >= 2 (1 Conv1d layer + >= 1 ChebConv layer)")
+        self.conv1d = nn.Conv1d(in_channels=1, out_channels=encoder_channels, kernel_size=1)
+        self.cheb_layers = nn.ModuleList([
+            ChebConv(encoder_channels, encoder_channels, K=K)
+            for _ in range(encoder_layers - 1)
+        ])
+
+    def forward(self, x, edge_index, edge_weight):
+        # x: (batch, n_nodes, 1)
+        h = x.transpose(1, 2)          # (batch, 1, n_nodes)
+        h = F.relu(self.conv1d(h))     # (batch, encoder_channels, n_nodes)
+        h = h.transpose(1, 2)          # (batch, n_nodes, encoder_channels)
+        for cheb in self.cheb_layers:
+            h = F.relu(cheb(h, edge_index, edge_weight=edge_weight))
+        return h
 
 
 def _compute_cluster_schedule(n_start: int, n_final: int, levels: int) -> List[int]:
@@ -582,6 +611,8 @@ class DiffPoolGNN(nn.Module):
         full_mode: bool = False,
         n_levels: Optional[int] = None,
         n_nodes: Optional[int] = None,
+        encoder_channels: int = 16,
+        encoder_layers: int = 2,
     ):
         super().__init__()
         self.max_filters = max_filters
@@ -601,7 +632,16 @@ class DiffPoolGNN(nn.Module):
                 "There is no valid zero-pooling architecture -- use n_hybrid/n_levels >= 1."
             )
 
-        channels = _compute_channel_list(levels, max_filters)
+        # Full mode learns cluster assignments from scratch with no structural
+        # prior, which plan.md found collapses to near-random performance
+        # unless raw 1-dim node features are first enriched by this encoder
+        # (5.3.3: 27.7% -> 58.3% from the encoder alone). Hybrid mode's early
+        # levels already have a structural prior (HEM coarse edges), so it
+        # keeps starting from the raw 1-dim feature.
+        self.encoder = PrePoolingEncoder(encoder_channels, encoder_layers, K) if full_mode else None
+        start_channels = encoder_channels if full_mode else 1
+
+        channels = _compute_channel_list(levels, max_filters, start_channels=start_channels)
 
         if full_mode and levels > 1 and n_nodes is not None:
             cluster_schedule = _compute_cluster_schedule(n_nodes, max_clusters, levels)
@@ -633,6 +673,10 @@ class DiffPoolGNN(nn.Module):
 
         edge_index = self.base_edge_index
         edge_weight = self.base_edge_weight
+
+        if self.encoder is not None:
+            H = self.encoder(H, edge_index, edge_weight)
+
         aux_records = []
 
         for layer in self.diffpool_layers:
@@ -659,6 +703,8 @@ def build_diffpool_model(
     K: int = 2,
     full_mode: bool = False,
     n_levels: Optional[int] = None,
+    encoder_channels: int = 16,
+    encoder_layers: int = 2,
     **kwargs,
 ):
     """Build a DiffPool-based classifier.
@@ -713,6 +759,8 @@ def build_diffpool_model(
         full_mode=full_mode,
         n_levels=n_levels,
         n_nodes=base_graph.num_nodes,
+        encoder_channels=encoder_channels,
+        encoder_layers=encoder_layers,
     )
 
     if full_mode:
@@ -720,8 +768,11 @@ def build_diffpool_model(
     else:
         levels = n_hybrid + 1
 
-    # Last layer always pools to max_clusters nodes → flatten
-    last_channels = min(2 ** levels, max_filters)
+    # Last layer always pools to max_clusters nodes → flatten. Channel
+    # doubling starts from encoder_channels in full mode (the pre-pooling
+    # encoder's output width) instead of the raw 1-dim input.
+    start_channels = encoder_channels if full_mode else 1
+    last_channels = min(start_channels * 2 ** levels, max_filters)
     mlp_input_dim = max_clusters * last_channels
 
     mlp_model = FCModel(

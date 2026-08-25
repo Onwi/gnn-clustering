@@ -42,15 +42,21 @@ def build_hp_config(args):
         hp_config = {
             "lr": tune.loguniform(1e-4, 1e-1),
             "weight_decay": tune.loguniform(1e-4, 1e-1),
-            "lambda_link_pred": tune.loguniform(1e-5, 1e-1),
-            "lambda_entropy": tune.loguniform(1e-5, 1e-1),
+            # narrowed to plan.md's documented Full DiffPool search range
+            # (lambda_link, lambda_ent in [1e-5, 1e-3]) rather than the
+            # wider [1e-5, 1e-1] that mostly samples values too large.
+            "lambda_link_pred": tune.loguniform(1e-5, 1e-3),
+            "lambda_entropy": tune.loguniform(1e-5, 1e-3),
             "eta_min": 0.00001,
             "T_0": 1,
             "T_mult": 2,
         }
     else:
         hp_config = {
-            "lr": args.lr if args.lr is not None else 0.05,
+            # plan.md: default lr=0.05 fails, lr=0.0008 is the value that
+            # actually converges for Full DiffPool -- use that as the
+            # non-tuning default instead of the known-failing 0.05.
+            "lr": args.lr if args.lr is not None else 0.0008,
             "weight_decay": args.weight_decay if args.weight_decay is not None else 0.01,
             "lambda_link_pred": args.lambda_link_pred if args.lambda_link_pred is not None else 0.001,
             "lambda_entropy": args.lambda_entropy if args.lambda_entropy is not None else 0.001,
@@ -130,6 +136,8 @@ def train_and_validate_model(
         dense_threshold=args.dense_threshold,
         full_mode=full_mode,
         n_levels=n_hybrid,
+        encoder_channels=args.encoder_channels,
+        encoder_layers=args.encoder_layers,
     )
     model = model.to(device=device)
 
@@ -235,6 +243,11 @@ def parse_args():
                         help="Maximum feature dimension (grows progressivly: 1,2,4,...,max_filters)")
     parser.add_argument("--max-clusters", type=int, default=32,
                         help="Maximum clusters per DiffPoolLayer (bound on k)")
+    parser.add_argument("--encoder-channels", type=int, default=16,
+                        help="Full-mode pre-pooling encoder output width (1D-Conv -> ChebConv). "
+                             "plan.md 5.3.3: 16ch is the config that reaches 71.68%% (vs 27.7%% with no encoder)")
+    parser.add_argument("--encoder-layers", type=int, default=2,
+                        help="Full-mode pre-pooling encoder depth (1 Conv1d layer + (layers-1) ChebConv layers)")
     parser.add_argument("--dense-threshold", type=int, default=500,
                         help="Node count below which full mode (dense adjacency pooling) is used")
 
@@ -363,6 +376,8 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
         dense_threshold=args.dense_threshold,
         full_mode=full_mode,
         n_levels=n_hybrid,
+        encoder_channels=args.encoder_channels,
+        encoder_layers=args.encoder_layers,
     )
     model = model.to(device=device)
 
