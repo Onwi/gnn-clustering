@@ -2,6 +2,7 @@
 /results
 /dev/*.ipynb
 /outputs
+/outputs_*
 /tests
 /artifacts
 
