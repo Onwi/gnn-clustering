@@ -38,19 +38,32 @@ def build_data_loaders(*args, batch_size, num_workers, device='cpu'):
 
 
 def build_hp_config(args):
+    pooling_type = args.pooling_type
     if args.tune:
         hp_config = {
             "lr": tune.loguniform(1e-4, 1e-1),
             "weight_decay": tune.loguniform(1e-4, 1e-1),
-            # narrowed to plan.md's documented Full DiffPool search range
-            # (lambda_link, lambda_ent in [1e-5, 1e-3]) rather than the
-            # wider [1e-5, 1e-1] that mostly samples values too large.
-            "lambda_link_pred": tune.loguniform(1e-5, 1e-3),
-            "lambda_entropy": tune.loguniform(1e-5, 1e-3),
             "eta_min": 0.00001,
             "T_0": 1,
             "T_mult": 2,
         }
+        if pooling_type == "dmon":
+            hp_config["lambda_link_pred"] = 0.0
+            hp_config["lambda_entropy"] = 0.0
+            # Modularity is bounded in [-0.5, 1] and the collapse term in
+            # [0, sqrt(max_clusters)-1] -- both O(1), unlike DiffPool's
+            # link-pred/entropy losses which need weights near 1e-4. Start
+            # the tuned range an order of magnitude or two higher.
+            hp_config["lambda_modularity"] = tune.loguniform(1e-3, 1e1)
+            hp_config["lambda_collapse"] = tune.loguniform(1e-3, 1e1)
+        else:
+            # narrowed to plan.md's documented Full DiffPool search range
+            # (lambda_link, lambda_ent in [1e-5, 1e-3]) rather than the
+            # wider [1e-5, 1e-1] that mostly samples values too large.
+            hp_config["lambda_link_pred"] = tune.loguniform(1e-5, 1e-3)
+            hp_config["lambda_entropy"] = tune.loguniform(1e-5, 1e-3)
+            hp_config["lambda_modularity"] = 0.0
+            hp_config["lambda_collapse"] = 0.0
     else:
         hp_config = {
             # plan.md: default lr=0.05 fails, lr=0.0008 is the value that
@@ -58,12 +71,20 @@ def build_hp_config(args):
             # non-tuning default instead of the known-failing 0.05.
             "lr": args.lr if args.lr is not None else 0.0008,
             "weight_decay": args.weight_decay if args.weight_decay is not None else 0.01,
-            "lambda_link_pred": args.lambda_link_pred if args.lambda_link_pred is not None else 0.001,
-            "lambda_entropy": args.lambda_entropy if args.lambda_entropy is not None else 0.001,
             "eta_min": 0.00001,
             "T_0": 1,
             "T_mult": 2,
         }
+        if pooling_type == "dmon":
+            hp_config["lambda_link_pred"] = 0.0
+            hp_config["lambda_entropy"] = 0.0
+            hp_config["lambda_modularity"] = args.lambda_modularity if args.lambda_modularity is not None else 1.0
+            hp_config["lambda_collapse"] = args.lambda_collapse if args.lambda_collapse is not None else 1.0
+        else:
+            hp_config["lambda_link_pred"] = args.lambda_link_pred if args.lambda_link_pred is not None else 0.001
+            hp_config["lambda_entropy"] = args.lambda_entropy if args.lambda_entropy is not None else 0.001
+            hp_config["lambda_modularity"] = 0.0
+            hp_config["lambda_collapse"] = 0.0
     return hp_config
 
 
@@ -93,6 +114,8 @@ def train_and_validate_model(
     T_mult = hp_config["T_mult"]
     lambda_link_pred = hp_config["lambda_link_pred"]
     lambda_entropy = hp_config["lambda_entropy"]
+    lambda_modularity = hp_config["lambda_modularity"]
+    lambda_collapse = hp_config["lambda_collapse"]
 
     # ---- data ----
     dataset_kwargs = dict(return_original_set=True, random_state=random_state)
@@ -138,6 +161,8 @@ def train_and_validate_model(
         n_levels=n_hybrid,
         encoder_channels=args.encoder_channels,
         encoder_layers=args.encoder_layers,
+        pooling_type=args.pooling_type,
+        collapse_regularization=args.collapse_regularization,
     )
     model = model.to(device=device)
 
@@ -169,6 +194,8 @@ def train_and_validate_model(
             loss_fn=loss_fn,
             lambda_link_pred=lambda_link_pred,
             lambda_entropy=lambda_entropy,
+            lambda_modularity=lambda_modularity,
+            lambda_collapse=lambda_collapse,
         )
         validation_metrics = evaluate_clf(
             model=model, validation_loader=val_loader, device=device, loss_fn=loss_fn
@@ -209,7 +236,7 @@ def train_and_validate_model(
         mode_tag = "full" if args.full_mode else "hybrid"
         path_experiment = (
             Path(args.path_output)
-            / f"diffpool_{mode_tag}{n_hybrid}_rep{rep}"
+            / f"{args.pooling_type}_{mode_tag}{n_hybrid}_rep{rep}"
         )
         analyze_final_model_results(
             pd.DataFrame({
@@ -252,7 +279,15 @@ def parse_args():
                         help="Node count below which full mode (dense adjacency pooling) is used")
 
     parser.add_argument("--full-mode", action="store_true",
-                        help="Use full DiffPool everywhere (no hybrid levels, no HEM coarse edges)")
+                        help="Use full learned pooling everywhere (no hybrid levels, no HEM coarse edges)")
+    parser.add_argument("--pooling-type", choices=["diffpool", "dmon"], default="diffpool",
+                        help="Learned-assignment mechanism used by full-mode pooling levels: "
+                             "'diffpool' (link-pred + entropy losses) or 'dmon' (Deep Modularity "
+                             "Networks -- modularity + collapse-regularization losses, "
+                             "Tsitsulin et al. 2023). Hybrid levels are unaffected either way.")
+    parser.add_argument("--collapse-regularization", type=float, default=1.0,
+                        help="DMoN only: weight of the collapse term relative to modularity "
+                             "within each layer (the paper's internal hyperparameter).")
 
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--tune", action="store_true")
@@ -263,9 +298,13 @@ def parse_args():
     parser.add_argument("--weight-decay", type=float, default=None,
                         help="Override weight_decay (non-tuning only)")
     parser.add_argument("--lambda-link-pred", type=float, default=None,
-                        help="Override lambda_link_pred (non-tuning only)")
+                        help="Override lambda_link_pred (non-tuning only, --pooling-type diffpool)")
     parser.add_argument("--lambda-entropy", type=float, default=None,
-                        help="Override lambda_entropy (non-tuning only)")
+                        help="Override lambda_entropy (non-tuning only, --pooling-type diffpool)")
+    parser.add_argument("--lambda-modularity", type=float, default=None,
+                        help="Override lambda_modularity (non-tuning only, --pooling-type dmon)")
+    parser.add_argument("--lambda-collapse", type=float, default=None,
+                        help="Override lambda_collapse (non-tuning only, --pooling-type dmon)")
 
     parser.add_argument("--cpu-per-trial", type=float, default=1)
     parser.add_argument("--gpu-per-trial", type=float, default=0.1)
@@ -378,6 +417,8 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
         n_levels=n_hybrid,
         encoder_channels=args.encoder_channels,
         encoder_layers=args.encoder_layers,
+        pooling_type=args.pooling_type,
+        collapse_regularization=args.collapse_regularization,
     )
     model = model.to(device=device)
 
@@ -402,6 +443,8 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
     )
     lambda_link_pred = config["lambda_link_pred"]
     lambda_entropy = config["lambda_entropy"]
+    lambda_modularity = config["lambda_modularity"]
+    lambda_collapse = config["lambda_collapse"]
 
     records = []
     predictions, labels = None, None
@@ -418,6 +461,8 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
             loss_fn=loss_fn,
             lambda_link_pred=lambda_link_pred,
             lambda_entropy=lambda_entropy,
+            lambda_modularity=lambda_modularity,
+            lambda_collapse=lambda_collapse,
         )
 
         if epoch == max_epochs - 1:
@@ -519,7 +564,7 @@ def run_holdout(args, random_state, rep):
         hp_config = build_hp_config(args)
         path_experiment = (
             Path(args.path_output)
-            / f"diffpool_{mode_tag}{n_hybrid}_rep{rep}"
+            / f"{args.pooling_type}_{mode_tag}{n_hybrid}_rep{rep}"
         )
         if path_experiment.exists():
             print(f"Path {path_experiment} already exists. Skipping")

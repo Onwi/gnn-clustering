@@ -18,6 +18,8 @@ def train_epoch_clf(
     lambda_l1_node_importances: float = None,
     lambda_link_pred: float = 0.0,
     lambda_entropy: float = 0.0,
+    lambda_modularity: float = 0.0,
+    lambda_collapse: float = 0.0,
     grad_clip_max_norm: float = 5.0,
 ):
     model.train()
@@ -39,7 +41,9 @@ def train_epoch_clf(
             for ni in model[0].node_importances:
                 loss += lambda_l1_node_importances * torch.sum(torch.abs(ni)) / ni.size()[0]
 
-        aux_loss = get_diffpool_aux_losses(model, lambda_link_pred, lambda_entropy)
+        aux_loss = get_diffpool_aux_losses(
+            model, lambda_link_pred, lambda_entropy, lambda_modularity, lambda_collapse
+        )
         loss = loss + aux_loss
 
         loss.backward()

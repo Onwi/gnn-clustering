@@ -257,8 +257,12 @@ Input (batch, 14000 genes)
 
 ### `scripts/experiments/diffpool_experiment.py`
 - Two modes controlled by `--full-mode` flag:
-  - **Default (hybrid)**: iterates n_hybrid=[0..N], uses pre-computed HEM coarse edges + parents for early levels. Output dir: `diffpool_hybrid{N}_rep{R}/`
-  - **`--full-mode`**: all levels are full learned DiffPool, no HEM pre-computed data needed beyond the base graph. Output dir: `diffpool_full{N}_rep{R}/`
+  - **Default (hybrid)**: iterates n_hybrid=[0..N], uses pre-computed HEM coarse edges + parents for early levels. Output dir: `{pooling_type}_hybrid{N}_rep{R}/`
+  - **`--full-mode`**: all levels are full learned pooling, no HEM pre-computed data needed beyond the base graph. Output dir: `{pooling_type}_full{N}_rep{R}/`
+- `--pooling-type {diffpool,dmon}` (default `diffpool`) selects the learned-assignment mechanism used by every level's full-mode branch (hybrid-mode early levels are unaffected either way, since they never leave the HEM-scatter branch):
+  - **`diffpool`**: `DiffPoolLayer` — link-prediction (adjacency reconstruction) + entropy aux losses, tuned via `--lambda-link-pred`/`--lambda-entropy`.
+  - **`dmon`**: `DMoNLayer` — Deep Modularity Networks (Tsitsulin et al., "Graph Clustering with Graph Neural Networks", JMLR 2023). Same `C = softmax(pool_gnn(x))` assignment and `X' = C^T Z` feature pooling as DiffPool, but the aux losses are modularity (`Q = Tr(C^T A C)/2m - ||C^T d||²/(2m)²`, computed via the same per-sample sparse `A @ C` trick as DiffPool's adjacency pooling — no dense `(n,n)` `to_dense_adj` call, so lower memory at level 0) and collapse regularization (`(√k/n)·‖Σ_i C_i‖₂ − 1`, 0 when cluster sizes are balanced, `√k−1` when everything collapses into one cluster) instead of link prediction + entropy. Tuned via `--lambda-modularity`/`--lambda-collapse` (and the DMoN-internal `--collapse-regularization`, default 1.0). Since one pooling_type's aux keys are always absent from the other's `_aux_records`, `get_diffpool_aux_losses()` (`models.py`) accepts all four lambdas and only the active pair ever contributes.
+  - Directory naming keeps `diffpool_hybrid{N}_rep{R}/` unchanged for the default `pooling_type` (backward compatible with existing output dirs and `scripts/analysis_v2/parsers.py`, which still labels it `"Learned DiffPool"`); DMoN runs land in `dmon_hybrid{N}_rep{R}/` / `dmon_full{N}_rep{R}/`, labeled `"Hybrid DMoN"` / `"Full DMoN"`.
 - Same Ray Tune integration pattern
 - OOM handling: catches CUDA OOM errors and skips to next config
 
@@ -287,7 +291,7 @@ Input (batch, 14000 genes)
 
 | File | Responsibility |
 |---|---|
-| `models.py` | All model definitions: `DiffPoolLayer`, `DiffPoolGNN` (hybrid + full_mode), `GNNPooling`, `FCModel`, `build_coarsening_model`, `build_diffpool_model`, `CohortAndTumorLoss` |
+| `models.py` | All model definitions: `DiffPoolLayer`, `DMoNLayer`, `DiffPoolGNN` (hybrid + full_mode, `pooling_type={'diffpool','dmon'}`), `GNNPooling`, `FCModel`, `build_coarsening_model`, `build_diffpool_model`, `get_diffpool_aux_losses`, `CohortAndTumorLoss` |
 | `networks.py` | Graph construction (`get_pyg_data`), level loading (`load_graph_levels`, `load_coarse_edges_for_diffpool`) |
 | `coarsening.py` | Heavy Edge Matching algorithm (`HEM`, `HEM_one_level`, `compute_perm`) |
 | `datasets.py` | Dataset wrappers (`get_genomic_classification_dataset`, `TCGACohorts`, `WrapperDataset`) |

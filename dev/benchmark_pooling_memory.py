@@ -40,6 +40,9 @@ def main():
     parser.add_argument("--K", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument("--pooling-type", choices=["diffpool", "dmon"], default="diffpool",
+                         help="DMoN skips DiffPool's dense (n,n) to_dense_adj() call used for "
+                              "the link-prediction loss, so it should show a lower level-0 peak.")
     args = parser.parse_args()
 
     if args.device == "cuda":
@@ -47,7 +50,7 @@ def main():
     device = args.device
     torch.manual_seed(args.seed)
 
-    print(f"config: n_nodes={args.n_nodes} n_edges={args.n_edges} "
+    print(f"config: pooling_type={args.pooling_type} n_nodes={args.n_nodes} n_edges={args.n_edges} "
           f"batch_size={args.batch_size} levels={args.levels} "
           f"max_clusters={args.max_clusters} max_filters={args.max_filters} K={args.K}")
 
@@ -63,6 +66,7 @@ def main():
         max_clusters=args.max_clusters,
         K=args.K,
         n_nodes=args.n_nodes,
+        pooling_type=args.pooling_type,
     ).to(device)
 
     print(f"cluster_schedule (per-level pooled node counts): {model.cluster_schedule}")

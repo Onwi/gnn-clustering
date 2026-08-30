@@ -488,16 +488,174 @@ class DiffPoolLayer(nn.Module):
         # The base topology (edge_index/edge_weight) is identical for every sample in
         # the batch -- only S varies per sample -- so `A @ S` never needs a dense
         # (n, n) copy of A, let alone one expanded per batch item. We compute `A @ S`
-        # per sample via a sparse-dense matmul (each is O(nnz * k) instead of O(n^2)),
-        # writing directly into a preallocated output tensor: a Python list/stack here
-        # would keep every per-sample result alive at once, doubling peak memory for no
-        # reason. Only the small (batch, k, k) `S^T @ (A @ S)` product uses a dense bmm.
+        # via a single batched sparse-dense matmul rather than one `torch.sparse.mm`
+        # call per sample: torch.sparse.mm only accepts a 2D dense operand, so the
+        # batch dim is folded into the column dim (n, batch*k) and split back out
+        # afterwards. Besides being one op instead of `batch_size`, this matters for
+        # autograd: differentiating `batch_size` separate sparse.mm calls each pays
+        # its own sparse-transpose/coalesce cost in the backward pass, which is the
+        # dominant cost of DMoNLayer's structurally-identical loop (its modularity
+        # loss, unlike this layer's link_pred_loss, actually depends on this A @ S
+        # branch, so that backward cost is real there -- see DMoNLayer.forward).
         A_sparse = torch.sparse_coo_tensor(edge_index, edge_weight, size=(n, n)).coalesce()
-        AS = torch.empty(batch_size, n, k, device=x.device, dtype=S.dtype)
-        for b in range(batch_size):
-            AS[b] = torch.sparse.mm(A_sparse, S[b])
+        S_flat = S.permute(1, 0, 2).reshape(n, batch_size * k)
+        AS = torch.sparse.mm(A_sparse, S_flat).reshape(n, batch_size, k).permute(1, 0, 2)
 
         A_next_dense = torch.bmm(S.transpose(1, 2), AS)             # (batch, k, k)
+        A_mean = A_next_dense.mean(dim=0)
+        A_mean = A_mean * (1 - torch.eye(k, device=A_mean.device))
+        edge_index_next, edge_weight_next = dense_to_sparse(A_mean)
+
+        return x_next, edge_index_next, edge_weight_next, aux
+
+
+class DMoNLayer(nn.Module):
+    """A single Deep Modularity Network (DMoN) pooling layer.
+
+    Learns a soft cluster assignment C via a GNN, same shape/role as
+    DiffPool's S, and pools features as X' = C^T Z. Unlike DiffPool, the
+    auxiliary objective is unsupervised graph clustering quality instead of
+    adjacency reconstruction: a modularity loss (rewards intra-cluster edge
+    density that exceeds the configuration-model null expectation) plus a
+    collapse regularization term (penalizes uneven cluster sizes, which
+    prevents the degenerate solution of assigning every node to one cluster).
+
+    Reference: Tsitsulin, Palowitch, Perozzi, Muller, "Graph Clustering with
+    Graph Neural Networks", JMLR 2023 (https://arxiv.org/abs/2006.16904).
+
+    Two modes, identical to DiffPoolLayer:
+      - hybrid: keeps pre-computed coarse edges for the next level
+                (identity message passing, learned clustering only)
+      - full:   pools adjacency via C^T A C and extracts sparse edges back
+
+    Parameters
+    ----------
+    in_channels : int
+    hidden_channels : int
+    max_clusters : int
+        Upper bound on the number of clusters this layer can produce.
+    K : int
+        Chebyshev filter order.
+    collapse_regularization : float
+        Weight of the collapse-regularization term relative to the
+        modularity term (the paper's single DMoN hyperparameter, typically
+        ~1.0). This is folded into the returned 'collapse_loss' so an outer
+        lambda_collapse only needs to scale the whole term against the
+        classification loss.
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int,
+        max_clusters: int,
+        K: int = 2,
+        collapse_regularization: float = 1.0,
+    ):
+        super().__init__()
+        self.embed_gnn = ChebConv(in_channels, hidden_channels, K=K)
+        self.pool_gnn = ChebConv(in_channels, max_clusters, K=K)
+        self.logit_pool_ratio = nn.Parameter(torch.tensor(0.0))
+        self.collapse_regularization = collapse_regularization
+        self._coarse_edge_index: Optional[torch.Tensor] = None
+        self._coarse_edge_weight: Optional[torch.Tensor] = None
+        self._parents: Optional[torch.Tensor] = None
+
+    def set_coarse_edges(self, edge_index: torch.Tensor, edge_weight: torch.Tensor, parents: Optional[torch.Tensor] = None):
+        self._coarse_edge_index = edge_index
+        self._coarse_edge_weight = edge_weight
+        self._parents = parents
+
+    @property
+    def pool_ratio(self) -> torch.Tensor:
+        return torch.sigmoid(self.logit_pool_ratio)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_weight: torch.Tensor,
+        min_nodes: int = 2,
+    ):
+        """Forward pass.
+
+        Returns
+        -------
+        x_next : (batch, k, hidden_channels)
+        edge_index_next : (2, e)
+        edge_weight_next : (e,)
+        aux : dict with keys 'modularity_loss', 'collapse_loss'
+        """
+        batch_size, n, _ = x.shape
+
+        # Embed features with message passing
+        z = F.relu(self.embed_gnn(x, edge_index, edge_weight=edge_weight))
+
+        # --- Hybrid mode with pre-computed HEM parents ---
+        if self._parents is not None:
+            # Efficient scatter-based pooling (no learned assignments)
+            x_next = scatter(z, self._parents, dim=1, reduce='mean')
+            aux = {'modularity_loss': 0.0, 'collapse_loss': 0.0}
+            return x_next, self._coarse_edge_index, self._coarse_edge_weight, aux
+
+        # --- Full mode: learn soft cluster assignments via pool_gnn ---
+        ratio = self.pool_ratio
+        k_raw = int(torch.ceil(torch.tensor(n, dtype=torch.float) * ratio).item())
+        k = max(min_nodes, min(k_raw, self.pool_gnn.out_channels))
+
+        c_raw = self.pool_gnn(x, edge_index, edge_weight=edge_weight)
+        C = F.softmax(c_raw[:, :, :k], dim=-1)
+
+        # Pool features: X' = C^T Z
+        x_next = torch.bmm(C.transpose(1, 2), z)
+
+        # --- pooled adjacency C^T A C, computed per-sample via sparse-dense
+        # matmul (same rationale as DiffPoolLayer: avoid materializing a
+        # dense (n, n) copy of A, which is identical across the batch) ---
+        # Batched sparse-dense matmul (one torch.sparse.mm call instead of a
+        # `batch_size`-iteration Python loop): unlike DiffPoolLayer, this
+        # layer's modularity loss genuinely depends on A_next_dense/degree
+        # below, so autograd must differentiate through this op. A loop of
+        # `batch_size` separate sparse.mm calls each pays its own sparse
+        # transpose/coalesce cost in backward (measured: ~3.2x slower per
+        # layer than DiffPoolLayer on the real 3534-node/3.7M-edge level-2
+        # graph, dominated by `batch_size` redundant coalesce calls);
+        # batching into one call cuts that down to a single coalesce.
+        A_sparse = torch.sparse_coo_tensor(edge_index, edge_weight, size=(n, n)).coalesce()
+        C_flat = C.permute(1, 0, 2).reshape(n, batch_size * k)
+        AC = torch.sparse.mm(A_sparse, C_flat).reshape(n, batch_size, k).permute(1, 0, 2)
+        A_next_dense = torch.bmm(C.transpose(1, 2), AC)  # (batch, k, k) = C^T A C
+
+        # --- modularity loss ---
+        # Q = (1/2m) * [Tr(C^T A C) - (1/2m) * ||C^T d||^2], where d is the
+        # (weighted) degree vector and m is the total edge weight. The base
+        # graph is shared across the batch, so d and m are computed once from
+        # the sparse adjacency rather than per-sample. edge_weight is assumed
+        # to list both directions of each undirected edge (as elsewhere in
+        # this codebase), hence the /2 when turning summed weight into m.
+        degree = torch.sparse.mm(A_sparse, torch.ones(n, 1, device=x.device, dtype=edge_weight.dtype)).squeeze(-1)
+        m = edge_weight.sum() / 2
+
+        trace_CAC = torch.diagonal(A_next_dense, dim1=-2, dim2=-1).sum(dim=-1)  # (batch,)
+        Cd = torch.einsum('bnk,n->bk', C, degree)  # (batch, k) = C^T d
+        deg_term = (Cd ** 2).sum(dim=-1)  # (batch,)
+        modularity = trace_CAC / (2 * m) - deg_term / (2 * m) ** 2
+        modularity_loss = -modularity.mean()
+
+        # --- collapse regularization ---
+        # L_c = (sqrt(k)/n) * ||sum_nodes C||_2 - 1: 0 when cluster sizes are
+        # perfectly balanced (n/k nodes each), sqrt(k)-1 in the degenerate
+        # case where every node is assigned to a single cluster.
+        cluster_sizes = C.sum(dim=1)  # (batch, k)
+        collapse_loss = (
+            (torch.sqrt(torch.tensor(float(k), device=x.device)) / n) * cluster_sizes.norm(dim=-1) - 1
+        ).mean()
+
+        aux = {
+            'modularity_loss': modularity_loss,
+            'collapse_loss': self.collapse_regularization * collapse_loss,
+        }
+
+        # --- output graph (full mode: extract sparse edges from pooled adjacency) ---
         A_mean = A_next_dense.mean(dim=0)
         A_mean = A_mean * (1 - torch.eye(k, device=A_mean.device))
         edge_index_next, edge_weight_next = dense_to_sparse(A_mean)
@@ -596,6 +754,13 @@ class DiffPoolGNN(nn.Module):
       spread geometrically from ``n_nodes`` down to ``max_clusters`` (see
       ``_compute_cluster_schedule``) instead of every layer collapsing to
       ``max_clusters`` in a single hop.
+
+    ``pooling_type`` selects the assignment-learning mechanism used by every
+    layer's full-mode (learned) branch: ``'diffpool'`` (default, link
+    prediction + entropy losses) or ``'dmon'`` (Deep Modularity Networks,
+    modularity + collapse-regularization losses -- see ``DMoNLayer``).
+    Hybrid-mode levels behave identically either way, since they never reach
+    the learned branch.
     """
     def __init__(
         self,
@@ -613,9 +778,15 @@ class DiffPoolGNN(nn.Module):
         n_nodes: Optional[int] = None,
         encoder_channels: int = 16,
         encoder_layers: int = 2,
+        pooling_type: str = 'diffpool',
+        collapse_regularization: float = 1.0,
     ):
         super().__init__()
         self.max_filters = max_filters
+
+        if pooling_type not in ('diffpool', 'dmon'):
+            raise ValueError(f"pooling_type must be 'diffpool' or 'dmon', got {pooling_type!r}")
+        self.pooling_type = pooling_type
 
         self.register_buffer('base_edge_index', base_edge_index)
         self.register_buffer('base_edge_weight', base_edge_weight)
@@ -652,14 +823,18 @@ class DiffPoolGNN(nn.Module):
         if parents_list is None:
             parents_list = []
 
+        LayerClass = DMoNLayer if pooling_type == 'dmon' else DiffPoolLayer
+        layer_extra_kwargs = {'collapse_regularization': collapse_regularization} if pooling_type == 'dmon' else {}
+
         self.diffpool_layers = nn.ModuleList()
         for i in range(levels):
             in_ch, out_ch = channels[i]
-            layer = DiffPoolLayer(
+            layer = LayerClass(
                 in_channels=in_ch,
                 hidden_channels=out_ch,
                 max_clusters=cluster_schedule[i],
                 K=K,
+                **layer_extra_kwargs,
             )
             if not full_mode and i < n_hybrid and coarse_edges is not None and i + 1 < len(coarse_edges):
                 ei, ew = coarse_edges[i + 1]
@@ -705,9 +880,11 @@ def build_diffpool_model(
     n_levels: Optional[int] = None,
     encoder_channels: int = 16,
     encoder_layers: int = 2,
+    pooling_type: str = 'diffpool',
+    collapse_regularization: float = 1.0,
     **kwargs,
 ):
-    """Build a DiffPool-based classifier.
+    """Build a DiffPool- or DMoN-based hierarchical pooling classifier.
 
     Parameters
     ----------
@@ -745,6 +922,11 @@ def build_diffpool_model(
         geometrically from ``base_graph.num_nodes`` down to ``max_clusters``
         instead of every layer collapsing to ``max_clusters`` in one hop
         (see ``DiffPoolGNN`` / ``_compute_cluster_schedule``).
+    pooling_type : str
+        ``'diffpool'`` (default) or ``'dmon'`` -- see ``DiffPoolGNN``.
+    collapse_regularization : float
+        DMoN-only: weight of the collapse term relative to modularity
+        within each layer (ignored when ``pooling_type='diffpool'``).
     """
     gnn_model = DiffPoolGNN(
         base_edge_index=base_graph.edge_index,
@@ -761,6 +943,8 @@ def build_diffpool_model(
         n_nodes=base_graph.num_nodes,
         encoder_channels=encoder_channels,
         encoder_layers=encoder_layers,
+        pooling_type=pooling_type,
+        collapse_regularization=collapse_regularization,
     )
 
     if full_mode:
@@ -786,14 +970,36 @@ def build_diffpool_model(
     return clf
 
 
-def get_diffpool_aux_losses(model: nn.Module, lambda_link_pred: float, lambda_entropy: float):
-    """Extract and sum auxiliary losses from a DiffPoolGNN inside a Sequential."""
+def get_diffpool_aux_losses(
+    model: nn.Module,
+    lambda_link_pred: float = 0.0,
+    lambda_entropy: float = 0.0,
+    lambda_modularity: float = 0.0,
+    lambda_collapse: float = 0.0,
+):
+    """Extract and sum weighted auxiliary losses from a DiffPoolGNN inside a Sequential.
+
+    Handles both DiffPool's aux keys ('link_pred_loss', 'entropy_loss') and
+    DMoN's ('modularity_loss', 'collapse_loss'): whichever pooling_type the
+    model was built with populates only its own pair of keys in each aux
+    record, so the other pair's weight simply multiplies a missing-key
+    default of 0.0 and contributes nothing.
+    """
+    weights = {
+        'link_pred_loss': lambda_link_pred,
+        'entropy_loss': lambda_entropy,
+        'modularity_loss': lambda_modularity,
+        'collapse_loss': lambda_collapse,
+    }
     for module in model.modules():
         if isinstance(module, DiffPoolGNN) and hasattr(module, '_aux_records'):
             records = module._aux_records
-            link_loss = sum(r['link_pred_loss'] for r in records)
-            ent_loss = sum(r['entropy_loss'] for r in records)
-            return lambda_link_pred * link_loss + lambda_entropy * ent_loss
+            total = 0.0
+            for key, weight in weights.items():
+                if weight == 0:
+                    continue
+                total = total + weight * sum(r.get(key, 0.0) for r in records)
+            return total
     return 0.0
 
 
