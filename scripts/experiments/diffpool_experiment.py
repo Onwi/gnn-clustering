@@ -37,8 +37,34 @@ def build_data_loaders(*args, batch_size, num_workers, device='cpu'):
     return tuple(loaders)
 
 
+def _warn_mismatched_lambda_flags(args):
+    """--lambda-link-pred/--lambda-entropy only apply to --pooling-type diffpool,
+    and --lambda-modularity/--lambda-collapse only apply to --pooling-type dmon;
+    build_hp_config silently zeroes whichever pair doesn't match, so warn loudly
+    instead of leaving a passed flag with no visible effect."""
+    diffpool_flags = {'--lambda-link-pred': args.lambda_link_pred, '--lambda-entropy': args.lambda_entropy}
+    dmon_flags = {'--lambda-modularity': args.lambda_modularity, '--lambda-collapse': args.lambda_collapse}
+    ignored = dmon_flags if args.pooling_type == 'diffpool' else diffpool_flags
+    set_flags = [name for name, val in ignored.items() if val is not None]
+    if set_flags:
+        print(
+            f"WARNING: --pooling-type {args.pooling_type} ignores {', '.join(set_flags)} "
+            f"(not used by this pooling type) -- these values will have no effect."
+        )
+
+
+def _cosine_restart_epochs(T_0, T_mult, n_cycles):
+    """Epoch count at which CosineAnnealingWarmRestarts(T_0, T_mult) completes
+    n_cycles restarts, i.e. lands back at a converged trough instead of
+    stopping mid-cycle. Used to align both the tuning-phase epoch budget
+    (ASHAScheduler's max_t) and the final-retrain epoch budget to schedule
+    boundaries, so validation reads never land on a noisy mid-cycle spike."""
+    return int(T_0 * (1 - T_mult**n_cycles) / (1 - T_mult))
+
+
 def build_hp_config(args):
     pooling_type = args.pooling_type
+    _warn_mismatched_lambda_flags(args)
     if args.tune:
         hp_config = {
             "lr": tune.loguniform(1e-4, 1e-1),
@@ -146,7 +172,7 @@ def train_and_validate_model(
         )
 
     if n_cycles is not None:
-        max_epochs = int(T_0 * (1 - T_mult**n_cycles) / (1 - T_mult))
+        max_epochs = _cosine_restart_epochs(T_0, T_mult, n_cycles)
 
     model = build_diffpool_model(
         base_graph=base_graph,
@@ -163,6 +189,7 @@ def train_and_validate_model(
         encoder_layers=args.encoder_layers,
         pooling_type=args.pooling_type,
         collapse_regularization=args.collapse_regularization,
+        sparsify_density=args.sparsify_density,
     )
     model = model.to(device=device)
 
@@ -288,6 +315,18 @@ def parse_args():
     parser.add_argument("--collapse-regularization", type=float, default=1.0,
                         help="DMoN only: weight of the collapse term relative to modularity "
                              "within each layer (the paper's internal hyperparameter).")
+    parser.add_argument("--sparsify-density", type=float, default=None,
+                        help="Full mode only: prune each level's pooled output adjacency to this "
+                             "fraction of edges per node (e.g. 0.04, matching stringdb_top100pc.csv's "
+                             "actual ~4%% density) before passing it to the next level, instead of "
+                             "leaving it fully connected (every softmax-derived entry is nonzero, "
+                             "so dense_to_sparse alone returns a complete graph). A fraction rather "
+                             "than a fixed edge count, since full-mode levels span very different "
+                             "widths (e.g. 1854 down to 32 in a 3-level schedule) and a fixed count "
+                             "can't match the same density at more than one of them. Only matters "
+                             "when multiple full-mode levels chain together -- the last level's "
+                             "output isn't consumed by anything downstream. Default None disables "
+                             "pruning (prior behavior).")
 
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--tune", action="store_true")
@@ -397,12 +436,10 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
             path_levels=path_levels, n_levels=max_levels, device=device
         )
 
-    best_result = results.get_best_result(scope="last")
+    best_result = results.get_best_result(scope="all")
     config = best_result.config
     if n_cycles is not None:
-        max_epochs = int(
-            config["T_0"] * (1 - config["T_mult"] ** n_cycles) / (1 - config["T_mult"])
-        )
+        max_epochs = _cosine_restart_epochs(config["T_0"], config["T_mult"], n_cycles)
 
     model = build_diffpool_model(
         base_graph=base_graph,
@@ -419,6 +456,7 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
         encoder_layers=args.encoder_layers,
         pooling_type=args.pooling_type,
         collapse_regularization=args.collapse_regularization,
+        sparsify_density=args.sparsify_density,
     )
     model = model.to(device=device)
 
@@ -540,7 +578,7 @@ def test_tuned_model(results, n_hybrid, args, path_experiment, random_state,
 
     analyze_final_model_results(
         df_metrics, predictions, labels,
-        results.get_best_result(scope='last').config,
+        results.get_best_result(scope='all').config,
         output_dir=path_experiment, classes=classes, model=model,
     )
 
@@ -588,9 +626,26 @@ def run_holdout(args, random_state, rep):
             continue
 
         path_ray = path_experiment / "ray_results"
+        # Tuning-phase epoch budget aligned to a CosineAnnealingWarmRestarts
+        # trough (T_0=1, T_mult=2, matching build_hp_config) instead of the
+        # arbitrary --max-epochs default -- otherwise trials get cut off
+        # mid-cycle, where loss is still oscillating, and get_best_result
+        # ends up comparing noise instead of converged validation loss.
+        tune_n_cycles = max(args.n_cycles - 1, 1)
+        tune_max_epochs = _cosine_restart_epochs(1, 2, tune_n_cycles)
+        # grace_period at the *previous* restart boundary rather than at
+        # max_t, so ASHA gets one real pruning checkpoint instead of none
+        # (grace_period == max_t means no trial is ever pruned early). The
+        # 2^n-1 restart sequence's consecutive-boundary ratio converges to
+        # reduction_factor=2 as n grows (3, 2.33, 2.14, 2.07, 2.03, ...), so
+        # the rung Ray computes automatically (max_t / reduction_factor)
+        # lands within ~1 epoch of this boundary -- still a converged
+        # trough, not a mid-cycle read.
+        grace_n_cycles = max(tune_n_cycles - 1, 1)
+        grace_period = _cosine_restart_epochs(1, 2, grace_n_cycles)
         scheduler = ASHAScheduler(
-            max_t=args.max_epochs,
-            grace_period=args.max_epochs,
+            max_t=tune_max_epochs,
+            grace_period=grace_period,
             reduction_factor=2,
         )
         trainable = partial(

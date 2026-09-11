@@ -5,6 +5,108 @@ Each entry: what changed, why, files touched, and how it was verified.
 
 ---
 
+## 3. Pooled-adjacency sparsification for full-mode pooling (2026-09-07)
+
+### Problem
+
+`_build_pooled_output_graph()` (both `DiffPoolLayer` and `DMoNLayer`'s shared full-mode output
+step) means the batch's pooled adjacency, drops the diagonal, and calls PyG's `dense_to_sparse`.
+But `dense_to_sparse` keeps every *numerically nonzero* entry as an edge, and since the pooled
+adjacency is built from softmax assignments (`S`/`C`), essentially no entry is ever exactly zero.
+So every full-mode level returns a **fully connected** `k x k` graph to the next level -- "sparse"
+only in tensor representation, not in structure. This is failure mode #3 from `analysis-approaches.MD`
+("the dense adjacency is a memory and optimization trap"): the original sparse, biologically
+meaningful PPI graph gets replaced by spurious full connectivity at every hop, and that corrupted
+structure is what the next level's `ChebConv` message-passing has to work with. Fix #1 (the
+progressive cluster schedule, entry #1 below) reduces *how much* compression happens per hop, but
+doesn't touch this -- every hop, regardless of schedule, still produces a fully connected output.
+
+This surfaced while scoping a **Full DMoN** run (multi-level full-mode pooling with
+`pooling_type='dmon'`, not yet attempted in this repo -- prior DMoN runs were all hybrid-mode,
+HEM-coarsened down to <=500 nodes before one learned pooling hop). In a multi-level full-mode
+chain the corruption compounds level over level, since each level's fully-connected output becomes
+the next level's input graph; in hybrid mode's single trailing full-mode layer this was harmless in
+practice, since nothing downstream consumes that layer's output graph (the classifier just flattens
+its pooled features).
+
+### Fix
+
+`_build_pooled_output_graph()` now accepts an optional `sparsify_density`. When given, it computes
+`top_k = max(1, round(sparsify_density * (k - 1)))` for that level's own width `k`, keeps only the
+`top_k` strongest edges per row of the (diagonal-dropped) pooled adjacency, then ORs the resulting
+mask with its transpose (an edge survives if *either* endpoint ranked it in its own top-k -- per-row
+top-k masks aren't symmetric in general even though the adjacency itself is) before converting to
+sparse. `None` (default) preserves the old fully-connected behavior.
+
+`sparsify_density` is a **fraction of each level's own width**, not a fixed edge count -- an earlier
+version of this fix used a fixed `sparsify_top_k` shared across all levels, but full-mode levels in
+the 3-level schedule span very different widths (e.g. 1854 down to 32), and a single fixed count
+can't match the same relative density at more than one of them (a count sized for 1854 columns is
+tiny relative to 243 columns, or vice versa). The fraction is meant to match the base PPI graph's
+*actual* density rather than an arbitrary constant: `stringdb_top100pc.csv` has ~11.9M edge rows
+over 19,385 nodes, i.e. avg degree ~1232 out of ~19,385 possible -- ~4% density (average degree /
+number of nodes, not edges/possible-pairs, since the CSV lists each undirected edge as a symmetric
+directed pair). At `sparsify_density=0.04`, the 3-level schedule's per-level top-k works out to ~74
+edges/node at level 0 (k=1854) and ~10 at level 1 (k=243, matching a level 0->1 hop rather than an
+absolute edge count).
+
+Threaded through as a constructor argument: `DiffPoolLayer`/`DMoNLayer` -> `DiffPoolGNN` (only
+forwarded into `layer_extra_kwargs` when `full_mode=True`, so hybrid mode's trailing full-mode
+layer -- which already ignores its own output graph -- is unaffected) -> `build_diffpool_model()`
+-> new `--sparsify-density` CLI flag in `scripts/experiments/diffpool_experiment.py`.
+
+This only fixes the *structural* corruption (full connectivity), not the compression-ratio problem
+(that's fix #1) or the auxiliary-loss-dominance problem (still open, see below) -- deliberately
+scoped to just these two, since a Full DMoN run's open question is specifically whether DMoN's
+modularity/collapse losses behave differently from DiffPool's link-pred/entropy losses once the
+architecture (schedule + real sparsity) stops confounding the comparison.
+
+### Files changed
+
+- `src/pooling_genomic/models.py`
+  - `_build_pooled_output_graph()`: added `sparsify_density` param and the per-level top-k-per-row +
+    symmetrize pruning logic (`top_k` derived from `sparsify_density * (k - 1)`).
+  - `DiffPoolLayer.__init__`/`forward()`, `DMoNLayer.__init__`/`forward()`: added `sparsify_density`
+    param, stored on `self`, passed through to `_build_pooled_output_graph()`.
+  - `DiffPoolGNN.__init__`: added `sparsify_density` param, forwarded into `layer_extra_kwargs` only
+    when `full_mode=True`.
+  - `build_diffpool_model()`: added `sparsify_density` param, passed to `DiffPoolGNN`.
+- `scripts/experiments/diffpool_experiment.py`: added `--sparsify-density` CLI flag, threaded into
+  both `build_diffpool_model(...)` call sites (initial tuning-phase model and final-retrain model).
+
+### Verification
+
+Using the `pooling_genomic` conda env:
+
+1. **Density measurement**: computed the base graph's actual degree stats directly from
+   `data/string_data/data/networks/stringdb_top100pc.csv` (19,385 nodes, 11,938,498 edge rows, mean
+   degree 1231.7, median 978) to ground `sparsify_density` in the real graph rather than a guess.
+2. **Structural**: on synthetic small graphs, `sparsify_density=None` returns the full `k*(k-1)`
+   non-diagonal edges every time (confirms the corruption is real in the current code, for both
+   `DiffPoolLayer` and `DMoNLayer`); `sparsify_density=0.04` prunes this substantially (e.g. k=25:
+   600 -> 48 edges). Directly confirmed the per-level top-k formula against the real 3-level
+   schedule's widths: `k=1854 -> top_k=74`, `k=243 -> top_k=10`, `k=32 -> top_k=1` (this last level's
+   output isn't consumed downstream, so its value doesn't matter in practice).
+3. **Gradients**: backward through the sparsified output graph's edge weights plus each layer's
+   auxiliary losses (`link_pred_loss`/`entropy_loss` for DiffPool, `modularity_loss`/`collapse_loss`
+   for DMoN) still produces valid `pool_gnn` gradients for both pooling types.
+4. **End-to-end**: `build_diffpool_model(..., full_mode=True, n_levels=3, sparsify_density=0.04)` on
+   a synthetic 200-node graph builds, confirms `cluster_schedule == [68, 23, 8]` (fix #1 unaffected),
+   and runs a full forward + backward pass for both `pooling_type='diffpool'` and `'dmon'`.
+5. `python3 -m py_compile` on both changed files.
+
+### Not addressed by this change (still open)
+
+- **Auxiliary-loss dominance** (failure mode #4 in `analysis-approaches.MD`): whether DMoN's
+  `lambda_modularity`/`lambda_collapse` need different tuning ranges at 14K-node full-mode scale
+  than the <=500-node hybrid-mode regime they've only been tuned in so far. Deliberately left to
+  the normal hyperparameter search rather than special-cased.
+- No gradient clipping in `engines.py::train_epoch_clf` (still listed as open under fix #1/#2).
+- A genuine **Full DMoN run has not yet been executed** -- this entry is architecture/code
+  preparation for one, not a result.
+
+---
+
 ## 2. Sparse-dense adjacency pooling for Full DiffPool (2026-08-23)
 
 ### Problem

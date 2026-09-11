@@ -391,6 +391,83 @@ def build_coarsening_model(
         return model
 
 
+def _compute_pool_k(pool_ratio: torch.Tensor, n: int, min_nodes: int, max_clusters: int) -> int:
+    """Number of output clusters for a pooling layer, clamped to [min_nodes, max_clusters]."""
+    k_raw = int(torch.ceil(torch.tensor(n, dtype=torch.float) * pool_ratio).item())
+    return max(min_nodes, min(k_raw, max_clusters))
+
+
+def _pool_adjacency(
+    edge_index: torch.Tensor,
+    edge_weight: torch.Tensor,
+    assignment: torch.Tensor,
+    n: int,
+    batch_size: int,
+    k: int,
+    compute_degree: bool = False,
+):
+    """Shared DiffPool/DMoN pooling step: batched sparse `A @ assignment` and the
+    resulting dense pooled adjacency `assignment^T @ A @ assignment`.
+
+    The base graph topology is identical for every sample in the batch -- only
+    `assignment` (DiffPool's S / DMoN's C) varies per sample -- so this is one
+    batched sparse-dense matmul (`torch.sparse.mm` only accepts a 2D dense
+    operand, so the batch dim is folded into the column dim and split back out
+    afterwards) rather than `batch_size` separate calls.
+
+    If `compute_degree` is set, the (weighted) degree vector is fused into the
+    same sparse matmul by appending a ones-column to the assignment matrix,
+    instead of paying for a second sparse-dense matmul pass over `A_sparse`.
+    """
+    A_sparse = torch.sparse_coo_tensor(edge_index, edge_weight, size=(n, n)).coalesce()
+    assign_flat = assignment.permute(1, 0, 2).reshape(n, batch_size * k)
+    degree = None
+    if compute_degree:
+        ones_col = torch.ones(n, 1, device=assignment.device, dtype=edge_weight.dtype)
+        out = torch.sparse.mm(A_sparse, torch.cat([assign_flat, ones_col], dim=1))
+        A_assign = out[:, :-1].reshape(n, batch_size, k).permute(1, 0, 2)
+        degree = out[:, -1]
+    else:
+        A_assign = torch.sparse.mm(A_sparse, assign_flat).reshape(n, batch_size, k).permute(1, 0, 2)
+    A_next_dense = torch.bmm(assignment.transpose(1, 2), A_assign)  # (batch, k, k)
+    return A_assign, A_next_dense, degree
+
+
+def _build_pooled_output_graph(A_next_dense: torch.Tensor, k: int, sparsify_density: Optional[float] = None):
+    """Mean the batch's pooled adjacency, drop the diagonal (self-loops),
+    optionally prune to a target per-row density, and convert to sparse
+    (edge_index, edge_weight) -- the shared final step of both
+    DiffPoolLayer and DMoNLayer's full-mode forward pass.
+
+    Without ``sparsify_density``, every entry of the softmax-derived pooled
+    adjacency is numerically nonzero, so ``dense_to_sparse`` returns a fully
+    connected k x k graph every level -- "sparse" only in tensor
+    representation, not in structure (see changes-from-claude.md fix #3).
+
+    When given, keeps only the top ``round(sparsify_density * (k - 1))``
+    (at least 1) outgoing edges per row, then ORs the mask with its
+    transpose so an edge survives if either endpoint ranked it in its own
+    top-k (rows aren't in general symmetric even though A_mean is, since
+    pruning is per-row). ``sparsify_density`` is a *fraction of this level's
+    own width* rather than a fixed edge count, because full-mode levels span
+    wildly different widths (e.g. 1854 down to 32 in a 3-level schedule) --
+    a fixed count can't match the base PPI graph's actual density (~4%,
+    measured from stringdb_top100pc.csv: ~11.9M edge rows / 19,385 nodes)
+    at more than one of them simultaneously.
+    """
+    A_mean = A_next_dense.mean(dim=0)
+    A_mean = A_mean * (1 - torch.eye(k, device=A_mean.device))
+    if sparsify_density is not None:
+        top_k = max(1, round(sparsify_density * (k - 1)))
+        if top_k < k - 1:
+            _, topk_idx = A_mean.topk(top_k, dim=-1)
+            mask = torch.zeros_like(A_mean, dtype=torch.bool)
+            mask.scatter_(1, topk_idx, True)
+            mask = mask | mask.t()
+            A_mean = A_mean * mask
+    return dense_to_sparse(A_mean)
+
+
 class DiffPoolLayer(nn.Module):
     """A single differentiable pooling layer (DiffPool-style).
 
@@ -408,12 +485,18 @@ class DiffPoolLayer(nn.Module):
         Upper bound on the number of clusters this layer can produce.
     K : int
         Chebyshev filter order.
+    sparsify_density : float, optional
+        Full mode only: prune the pooled output adjacency to this fraction
+        of edges per node (see ``_build_pooled_output_graph``) instead of
+        leaving it fully connected.
     """
-    def __init__(self, in_channels: int, hidden_channels: int, max_clusters: int, K: int = 2):
+    def __init__(self, in_channels: int, hidden_channels: int, max_clusters: int, K: int = 2,
+                 sparsify_density: Optional[float] = None):
         super().__init__()
         self.embed_gnn = ChebConv(in_channels, hidden_channels, K=K)
         self.pool_gnn = ChebConv(in_channels, max_clusters, K=K)
         self.logit_pool_ratio = nn.Parameter(torch.tensor(0.0))
+        self.sparsify_density = sparsify_density
         self._coarse_edge_index: Optional[torch.Tensor] = None
         self._coarse_edge_weight: Optional[torch.Tensor] = None
         self._parents: Optional[torch.Tensor] = None
@@ -456,9 +539,7 @@ class DiffPoolLayer(nn.Module):
             return x_next, self._coarse_edge_index, self._coarse_edge_weight, aux
 
         # --- Full mode: learn soft assignments via pool_gnn ---
-        ratio = self.pool_ratio
-        k_raw = int(torch.ceil(torch.tensor(n, dtype=torch.float) * ratio).item())
-        k = max(min_nodes, min(k_raw, self.pool_gnn.out_channels))
+        k = _compute_pool_k(self.pool_ratio, n, min_nodes, self.pool_gnn.out_channels)
 
         s_raw = self.pool_gnn(x, edge_index, edge_weight=edge_weight)
         S = F.softmax(s_raw[:, :, :k], dim=-1)
@@ -485,26 +566,13 @@ class DiffPoolLayer(nn.Module):
         }
 
         # --- output graph (full mode: extract sparse edges from pooled adjacency) ---
-        # The base topology (edge_index/edge_weight) is identical for every sample in
-        # the batch -- only S varies per sample -- so `A @ S` never needs a dense
-        # (n, n) copy of A, let alone one expanded per batch item. We compute `A @ S`
-        # via a single batched sparse-dense matmul rather than one `torch.sparse.mm`
-        # call per sample: torch.sparse.mm only accepts a 2D dense operand, so the
-        # batch dim is folded into the column dim (n, batch*k) and split back out
-        # afterwards. Besides being one op instead of `batch_size`, this matters for
-        # autograd: differentiating `batch_size` separate sparse.mm calls each pays
-        # its own sparse-transpose/coalesce cost in the backward pass, which is the
-        # dominant cost of DMoNLayer's structurally-identical loop (its modularity
-        # loss, unlike this layer's link_pred_loss, actually depends on this A @ S
-        # branch, so that backward cost is real there -- see DMoNLayer.forward).
-        A_sparse = torch.sparse_coo_tensor(edge_index, edge_weight, size=(n, n)).coalesce()
-        S_flat = S.permute(1, 0, 2).reshape(n, batch_size * k)
-        AS = torch.sparse.mm(A_sparse, S_flat).reshape(n, batch_size, k).permute(1, 0, 2)
-
-        A_next_dense = torch.bmm(S.transpose(1, 2), AS)             # (batch, k, k)
-        A_mean = A_next_dense.mean(dim=0)
-        A_mean = A_mean * (1 - torch.eye(k, device=A_mean.device))
-        edge_index_next, edge_weight_next = dense_to_sparse(A_mean)
+        # See `_pool_adjacency`: this never needs a dense (n, n) copy of A, let
+        # alone one expanded per batch item -- `A @ S` is one batched sparse-dense
+        # matmul shared with DMoNLayer's structurally-identical step (its
+        # modularity loss, unlike this layer's link_pred_loss, actually depends
+        # on this A @ S branch, so its backward cost is real there).
+        _, A_next_dense, _ = _pool_adjacency(edge_index, edge_weight, S, n, batch_size, k)
+        edge_index_next, edge_weight_next = _build_pooled_output_graph(A_next_dense, k, self.sparsify_density)
 
         return x_next, edge_index_next, edge_weight_next, aux
 
@@ -542,6 +610,10 @@ class DMoNLayer(nn.Module):
         ~1.0). This is folded into the returned 'collapse_loss' so an outer
         lambda_collapse only needs to scale the whole term against the
         classification loss.
+    sparsify_density : float, optional
+        Full mode only: prune the pooled output adjacency to this fraction
+        of edges per node (see ``_build_pooled_output_graph``) instead of
+        leaving it fully connected.
     """
     def __init__(
         self,
@@ -550,12 +622,14 @@ class DMoNLayer(nn.Module):
         max_clusters: int,
         K: int = 2,
         collapse_regularization: float = 1.0,
+        sparsify_density: Optional[float] = None,
     ):
         super().__init__()
         self.embed_gnn = ChebConv(in_channels, hidden_channels, K=K)
         self.pool_gnn = ChebConv(in_channels, max_clusters, K=K)
         self.logit_pool_ratio = nn.Parameter(torch.tensor(0.0))
         self.collapse_regularization = collapse_regularization
+        self.sparsify_density = sparsify_density
         self._coarse_edge_index: Optional[torch.Tensor] = None
         self._coarse_edge_weight: Optional[torch.Tensor] = None
         self._parents: Optional[torch.Tensor] = None
@@ -598,9 +672,7 @@ class DMoNLayer(nn.Module):
             return x_next, self._coarse_edge_index, self._coarse_edge_weight, aux
 
         # --- Full mode: learn soft cluster assignments via pool_gnn ---
-        ratio = self.pool_ratio
-        k_raw = int(torch.ceil(torch.tensor(n, dtype=torch.float) * ratio).item())
-        k = max(min_nodes, min(k_raw, self.pool_gnn.out_channels))
+        k = _compute_pool_k(self.pool_ratio, n, min_nodes, self.pool_gnn.out_channels)
 
         c_raw = self.pool_gnn(x, edge_index, edge_weight=edge_weight)
         C = F.softmax(c_raw[:, :, :k], dim=-1)
@@ -608,22 +680,18 @@ class DMoNLayer(nn.Module):
         # Pool features: X' = C^T Z
         x_next = torch.bmm(C.transpose(1, 2), z)
 
-        # --- pooled adjacency C^T A C, computed per-sample via sparse-dense
-        # matmul (same rationale as DiffPoolLayer: avoid materializing a
-        # dense (n, n) copy of A, which is identical across the batch) ---
-        # Batched sparse-dense matmul (one torch.sparse.mm call instead of a
-        # `batch_size`-iteration Python loop): unlike DiffPoolLayer, this
-        # layer's modularity loss genuinely depends on A_next_dense/degree
-        # below, so autograd must differentiate through this op. A loop of
-        # `batch_size` separate sparse.mm calls each pays its own sparse
-        # transpose/coalesce cost in backward (measured: ~3.2x slower per
-        # layer than DiffPoolLayer on the real 3534-node/3.7M-edge level-2
-        # graph, dominated by `batch_size` redundant coalesce calls);
-        # batching into one call cuts that down to a single coalesce.
-        A_sparse = torch.sparse_coo_tensor(edge_index, edge_weight, size=(n, n)).coalesce()
-        C_flat = C.permute(1, 0, 2).reshape(n, batch_size * k)
-        AC = torch.sparse.mm(A_sparse, C_flat).reshape(n, batch_size, k).permute(1, 0, 2)
-        A_next_dense = torch.bmm(C.transpose(1, 2), AC)  # (batch, k, k) = C^T A C
+        # --- pooled adjacency C^T A C (see `_pool_adjacency`): unlike
+        # DiffPoolLayer, this layer's modularity loss genuinely depends on
+        # A_next_dense/degree below, so autograd must differentiate through
+        # this op -- batching into one sparse.mm call (instead of a
+        # `batch_size`-iteration Python loop, each paying its own sparse
+        # transpose/coalesce cost in backward) measured ~3.2x faster per
+        # layer on the real 3534-node/3.7M-edge level-2 graph. The degree
+        # vector is fused into this same matmul (`compute_degree=True`)
+        # rather than a second sparse-dense pass over `A_sparse`.
+        _, A_next_dense, degree = _pool_adjacency(
+            edge_index, edge_weight, C, n, batch_size, k, compute_degree=True
+        )
 
         # --- modularity loss ---
         # Q = (1/2m) * [Tr(C^T A C) - (1/2m) * ||C^T d||^2], where d is the
@@ -632,8 +700,13 @@ class DMoNLayer(nn.Module):
         # the sparse adjacency rather than per-sample. edge_weight is assumed
         # to list both directions of each undirected edge (as elsewhere in
         # this codebase), hence the /2 when turning summed weight into m.
-        degree = torch.sparse.mm(A_sparse, torch.ones(n, 1, device=x.device, dtype=edge_weight.dtype)).squeeze(-1)
-        m = edge_weight.sum() / 2
+        # Clamped away from 0: in chained full-mode DMoN layers, edge mass
+        # increasingly concentrates on the diagonal of C^T A C as upstream
+        # clustering improves -- that diagonal is dropped before the next
+        # level's edge_weight is built (`_build_pooled_output_graph`), so m
+        # can shrink toward 0 over training, and it is squared in the second
+        # term's denominator below.
+        m = torch.clamp(edge_weight.sum() / 2, min=1e-8)
 
         trace_CAC = torch.diagonal(A_next_dense, dim1=-2, dim2=-1).sum(dim=-1)  # (batch,)
         Cd = torch.einsum('bnk,n->bk', C, degree)  # (batch, k) = C^T d
@@ -656,9 +729,7 @@ class DMoNLayer(nn.Module):
         }
 
         # --- output graph (full mode: extract sparse edges from pooled adjacency) ---
-        A_mean = A_next_dense.mean(dim=0)
-        A_mean = A_mean * (1 - torch.eye(k, device=A_mean.device))
-        edge_index_next, edge_weight_next = dense_to_sparse(A_mean)
+        edge_index_next, edge_weight_next = _build_pooled_output_graph(A_next_dense, k, self.sparsify_density)
 
         return x_next, edge_index_next, edge_weight_next, aux
 
@@ -780,6 +851,7 @@ class DiffPoolGNN(nn.Module):
         encoder_layers: int = 2,
         pooling_type: str = 'diffpool',
         collapse_regularization: float = 1.0,
+        sparsify_density: Optional[float] = None,
     ):
         super().__init__()
         self.max_filters = max_filters
@@ -825,6 +897,8 @@ class DiffPoolGNN(nn.Module):
 
         LayerClass = DMoNLayer if pooling_type == 'dmon' else DiffPoolLayer
         layer_extra_kwargs = {'collapse_regularization': collapse_regularization} if pooling_type == 'dmon' else {}
+        if full_mode:
+            layer_extra_kwargs['sparsify_density'] = sparsify_density
 
         self.diffpool_layers = nn.ModuleList()
         for i in range(levels):
@@ -882,6 +956,7 @@ def build_diffpool_model(
     encoder_layers: int = 2,
     pooling_type: str = 'diffpool',
     collapse_regularization: float = 1.0,
+    sparsify_density: Optional[float] = None,
     **kwargs,
 ):
     """Build a DiffPool- or DMoN-based hierarchical pooling classifier.
@@ -927,6 +1002,11 @@ def build_diffpool_model(
     collapse_regularization : float
         DMoN-only: weight of the collapse term relative to modularity
         within each layer (ignored when ``pooling_type='diffpool'``).
+    sparsify_density : float, optional
+        Full mode only: prune each level's pooled output adjacency to this
+        fraction of edges per node instead of leaving it fully connected
+        (see ``_build_pooled_output_graph``). ``None`` (default) disables
+        pruning, matching prior behavior.
     """
     gnn_model = DiffPoolGNN(
         base_edge_index=base_graph.edge_index,
@@ -945,6 +1025,7 @@ def build_diffpool_model(
         encoder_layers=encoder_layers,
         pooling_type=pooling_type,
         collapse_regularization=collapse_regularization,
+        sparsify_density=sparsify_density,
     )
 
     if full_mode:
@@ -982,8 +1063,12 @@ def get_diffpool_aux_losses(
     Handles both DiffPool's aux keys ('link_pred_loss', 'entropy_loss') and
     DMoN's ('modularity_loss', 'collapse_loss'): whichever pooling_type the
     model was built with populates only its own pair of keys in each aux
-    record, so the other pair's weight simply multiplies a missing-key
-    default of 0.0 and contributes nothing.
+    record. `build_hp_config` (diffpool_experiment.py) always zeroes the
+    weight for the pair that doesn't apply to the model's pooling_type, so
+    the `weight == 0` check below skips indexing into records that legitimately
+    lack that key -- callers must preserve that invariant (never pass a
+    nonzero weight for a key a record can't have) rather than relying on a
+    silent per-key default here, so a real missing/mistyped key still raises.
     """
     weights = {
         'link_pred_loss': lambda_link_pred,
@@ -998,7 +1083,7 @@ def get_diffpool_aux_losses(
             for key, weight in weights.items():
                 if weight == 0:
                     continue
-                total = total + weight * sum(r.get(key, 0.0) for r in records)
+                total = total + weight * sum(r[key] for r in records)
             return total
     return 0.0
 
