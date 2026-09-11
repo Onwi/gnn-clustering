@@ -5,6 +5,113 @@ Each entry: what changed, why, files touched, and how it was verified.
 
 ---
 
+## 4. Three small correctness/cleanliness fixes found reviewing Full DMoN and adjacent code (2026-09-10)
+
+Found while re-reading the full Full DMoN implementation end to end, looking for further
+improvements after the shrunk-scope run reached 71.16%. Three independent, low-risk fixes;
+a fourth, larger finding (Hybrid mode's trailing learned layer operating on ~3,534 nodes, not
+the documented <=500, since `n_hybrid` is a level count matched against pre-computed HEM files,
+not a dynamic node-count check) is a behavioral question left for a separate experiment, not
+bundled into this entry.
+
+### 4a. Removed the dead `logit_pool_ratio` parameter
+
+**Problem:** `DiffPoolLayer`/`DMoNLayer` each had a `logit_pool_ratio` `nn.Parameter`, exposed via
+a `pool_ratio` property (`sigmoid(logit_pool_ratio)`), used by `_compute_pool_k` to compute
+`k_raw = ceil(n * pool_ratio)` before clamping to `max_clusters`. `torch.ceil` has zero gradient
+almost everywhere, so `logit_pool_ratio` never received a gradient and stayed frozen at its init
+value (`sigmoid(0) = 0.5`) for the entire life of training, despite being registered as a trainable
+parameter and included in the optimizer's param groups. Worse, at that permanently-fixed ratio,
+`k_raw` was always far larger than `max_clusters` in every configuration this codebase actually
+runs (every level's node count shrinks by more than 2x, `max_clusters` being the smaller side), so
+the clamp to `max_clusters` was binding every single time regardless -- the "learnable pooling
+ratio" had zero effect on the model's actual behavior, full stop.
+
+**Fix:** Removed `logit_pool_ratio`/`pool_ratio` entirely from both layer classes. `_compute_pool_k`
+now just takes `(n, min_nodes, max_clusters)` and returns `max_clusters` clamped to
+`[min_nodes, n]` -- exactly what the old code always computed in practice, made explicit instead of
+routed through a parameter that looked learnable but wasn't.
+
+### 4b. Removed the dead `dense_threshold` parameter
+
+**Problem:** `DiffPoolGNN`/`build_diffpool_model`/the CLI (`--dense-threshold`, default 500) all
+carried a `dense_threshold` parameter documented as "node count below which hybrid mode switches to
+full mode." Grepped the whole codebase: it was never read anywhere in the model-building logic,
+only threaded through signatures. The real switch point is `i < n_hybrid` in `DiffPoolGNN.__init__`
+-- a fixed *level count* against pre-computed HEM files, unrelated to `dense_threshold`'s value. A
+user passing `--dense-threshold 200` (or any value) saw zero effect on the model.
+
+**Fix:** Removed `dense_threshold` from `DiffPoolGNN.__init__`, `build_diffpool_model`, and the CLI.
+Corrected `DiffPoolGNN`'s docstring to describe what actually controls the switch (`n_hybrid`, a
+level count) and to flag that the trailing layer's real node count depends on HEM's own per-level
+reduction rate, not a fixed target -- e.g. `n_hybrid=2` leaves ~3,534 nodes on the real 14,133-node
+PPI graph, not the "<=500" figure the rest of the docs (plan.md, ARCHITECTURE.md) assume.
+
+### 4c. Corrected DiffPool's link-prediction loss to be a true per-sample loss
+
+**Problem:** `DiffPoolLayer`'s link-prediction loss averaged the assignment matrix `S` across the
+*batch* (`S_mean = S.mean(dim=0)`) before computing `SSᵀ` and comparing it against the (shared)
+adjacency `A`. Batch samples are different patients with different node features/assignments;
+averaging `S` before the quadratic term collapses that per-sample structure into one
+"population-average" assignment's self-similarity, which is a materially different (and weaker)
+target than a true per-sample reconstruction loss. `DMoNLayer`'s modularity loss doesn't have this
+issue -- it's computed per-sample from `A_next_dense` (itself batched) and averaged only at the end.
+
+**Fix:** Rewrote the loss as an exact per-sample `MSE(A/‖A‖_F, SSᵀ/‖SSᵀ‖_F)`, averaged over the
+batch, using an algebraic identity instead of ever materializing a dense `(n, n)` matrix per sample
+(infeasible at this codebase's scale -- up to 14,133 nodes at full-mode level 0):
+- `⟨A, SSᵀ⟩_F = trace(SᵀAS)` (cyclic trace), which is exactly `A_next_dense`'s diagonal, already
+  computed by `_pool_adjacency` for the output graph -- reused rather than recomputed.
+- `‖SSᵀ‖_F = ‖SᵀS‖_F` for any `S`, since `SSᵀ` is symmetric: `‖SSᵀ‖_F² = trace((SSᵀ)²) =
+  trace((SᵀS)²) = ‖SᵀS‖_F²`. `SᵀS` is only `(k, k)`, cheap to form per sample via one `bmm`.
+- `‖A‖_F = sqrt(Σ edge_weight²)`, computed directly from the sparse edge list -- no dense copy.
+
+This also removes the `to_dense_adj` (n, n) materialization from `DiffPoolLayer.forward()`
+entirely (it was only ever used for this loss), and reorders `_pool_adjacency` to run before the
+loss instead of after, so its result is shared between the loss and the output-graph construction
+rather than computed twice.
+
+### Files changed
+
+- `src/pooling_genomic/models.py`
+  - `_compute_pool_k()`: dropped the `pool_ratio` parameter, simplified to `max(min_nodes,
+    min(max_clusters, n))`.
+  - `DiffPoolLayer`/`DMoNLayer`: removed `logit_pool_ratio`/`pool_ratio`; `DiffPoolLayer.forward()`
+    rewritten (link-prediction loss, `_pool_adjacency` reordered before the aux-loss block, dense
+    `to_dense_adj` call removed).
+  - `DiffPoolGNN.__init__`, `build_diffpool_model()`: removed `dense_threshold` parameter;
+    docstrings corrected.
+  - Removed the now-unused `to_dense_adj` import.
+- `scripts/experiments/diffpool_experiment.py`: removed `--dense-threshold` CLI flag and both
+  `dense_threshold=args.dense_threshold` pass-throughs.
+
+### Verification
+
+Using the `pooling_genomic` conda env:
+
+1. `_compute_pool_k`: checked directly against the values it needs to reproduce
+   (`_compute_pool_k(14133, 2, 1854) == 1854`, `_compute_pool_k(243, 2, 32) == 32`,
+   `_compute_pool_k(5, 2, 32) == 5`, correctly clamped by `n`).
+2. Link-prediction loss: on a small synthetic graph (n=40, k=6, batch=5, de-duplicated edges),
+   compared the new trace-identity formula against a brute-force per-sample dense `SSᵀ` reference
+   computed independently -- matched to `5.8e-11` absolute difference (float32 precision), both in
+   the batch-mean and every individual per-sample value.
+3. End-to-end: `build_diffpool_model(...)` for all 4 combinations of `pooling_type in
+   {diffpool, dmon}` x `full_mode in {True, False}` on a synthetic 200-node graph -- each builds,
+   runs forward + backward, and produces no NaN gradients.
+4. `python3 -m py_compile` on both changed files; confirmed `--dense-threshold` no longer appears
+   in `--help` output and no other file in the repo references `dense_threshold`, `pool_ratio`, or
+   `logit_pool_ratio`.
+
+### Not addressed by this change (separate, larger question)
+
+- Whether re-running the Hybrid comparison with `n_hybrid=5` (landing the trailing learned layer at
+  ~442 nodes, close to the long-documented "<=500" design point, instead of the ~3,534 nodes
+  `n_hybrid=2` actually produces) changes the Hybrid vs. Full DiffPool/DMoN comparison -- this is a
+  behavioral experiment, not a correctness fix, and wasn't bundled into this entry.
+
+---
+
 ## 3. Pooled-adjacency sparsification for full-mode pooling (2026-09-07)
 
 ### Problem

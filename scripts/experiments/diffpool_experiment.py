@@ -182,7 +182,6 @@ def train_and_validate_model(
         n_hybrid=n_hybrid,
         max_filters=args.max_filters,
         max_clusters=args.max_clusters,
-        dense_threshold=args.dense_threshold,
         full_mode=full_mode,
         n_levels=n_hybrid,
         encoder_channels=args.encoder_channels,
@@ -302,8 +301,6 @@ def parse_args():
                              "plan.md 5.3.3: 16ch is the config that reaches 71.68%% (vs 27.7%% with no encoder)")
     parser.add_argument("--encoder-layers", type=int, default=2,
                         help="Full-mode pre-pooling encoder depth (1 Conv1d layer + (layers-1) ChebConv layers)")
-    parser.add_argument("--dense-threshold", type=int, default=500,
-                        help="Node count below which full mode (dense adjacency pooling) is used")
 
     parser.add_argument("--full-mode", action="store_true",
                         help="Use full learned pooling everywhere (no hybrid levels, no HEM coarse edges)")
@@ -449,7 +446,6 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
         n_hybrid=n_hybrid,
         max_filters=args.max_filters,
         max_clusters=args.max_clusters,
-        dense_threshold=args.dense_threshold,
         full_mode=full_mode,
         n_levels=n_hybrid,
         encoder_channels=args.encoder_channels,
