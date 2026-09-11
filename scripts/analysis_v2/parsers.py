@@ -41,16 +41,29 @@ def parse_all_results(path_output: Path) -> pd.DataFrame:
             records.append(record)
             continue
 
-        # DiffPool: diffpool_hybrid{N}_rep{R}
-        m = re.match(r"diffpool_hybrid(\d+)_rep(\d+)", dirname)
+        # Learned pooling: {diffpool,dmon}_{hybrid,full}{N}_rep{R}
+        m = re.match(r"(diffpool|dmon)_(hybrid|full)(\d+)_rep(\d+)", dirname)
         if m:
+            pooling_type, mode_tag, n_hybrid, rep = m.groups()
+            model_label = {
+                # "Learned DiffPool" kept as-is (rather than "Hybrid DiffPool")
+                # for backward compatibility with scripts/analysis_v2/main.py
+                # and hyperparam_sensitivity.py, which filter on this exact
+                # string for existing diffpool_hybrid{N}_rep{R} output dirs.
+                ("diffpool", "hybrid"): "Learned DiffPool",
+                ("diffpool", "full"): "Full DiffPool",
+                ("dmon", "hybrid"): "Hybrid DMoN",
+                ("dmon", "full"): "Full DMoN",
+            }[(pooling_type, mode_tag)]
             record = dict(
-                model="Learned DiffPool",
+                model=model_label,
+                pooling_type=pooling_type,
+                full_mode=mode_tag == "full",
                 n_levels=None,
-                rep=int(m.group(2)),
+                rep=int(rep),
                 weighted_pooling=None,
                 use_convs=None,
-                n_hybrid=int(m.group(1)),
+                n_hybrid=int(n_hybrid),
                 dirname=dirname,
             )
             record.update(last)
@@ -95,4 +108,5 @@ def load_all_outputs(df_meta: pd.DataFrame) -> dict:
 def _config_key(row) -> str:
     if row["model"] == "Fixed HEM":
         return f"HEM_L{row['n_levels']}_W{row['weighted_pooling']}_C{row['use_convs']}_R{row['rep']}"
-    return f"DP_H{row['n_hybrid']}_R{row['rep']}"
+    prefix = "DMoN" if row.get("pooling_type") == "dmon" else "DP"
+    return f"{prefix}_H{row['n_hybrid']}_R{row['rep']}"
