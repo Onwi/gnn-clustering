@@ -187,8 +187,8 @@ def train_and_validate_model(
         encoder_channels=args.encoder_channels,
         encoder_layers=args.encoder_layers,
         pooling_type=args.pooling_type,
-        collapse_regularization=args.collapse_regularization,
         sparsify_density=args.sparsify_density,
+        assign_dropout=args.assign_dropout,
     )
     model = model.to(device=device)
 
@@ -309,9 +309,12 @@ def parse_args():
                              "'diffpool' (link-pred + entropy losses) or 'dmon' (Deep Modularity "
                              "Networks -- modularity + collapse-regularization losses, "
                              "Tsitsulin et al. 2023). Hybrid levels are unaffected either way.")
-    parser.add_argument("--collapse-regularization", type=float, default=1.0,
-                        help="DMoN only: weight of the collapse term relative to modularity "
-                             "within each layer (the paper's internal hyperparameter).")
+    parser.add_argument("--assign-dropout", type=float, default=0.5,
+                        help="Dropout applied to each layer's raw assignment logits before the "
+                             "softmax, for both pooling types, whenever the learned-assignment "
+                             "branch is reached (hybrid mode's trailing layer included). Tsitsulin "
+                             "et al. (DMoN paper) use 0.5 and report it specifically prevents "
+                             "gradient descent from getting stuck in a degenerate assignment.")
     parser.add_argument("--sparsify-density", type=float, default=None,
                         help="Full mode only: prune each level's pooled output adjacency to this "
                              "fraction of edges per node (e.g. 0.04, matching stringdb_top100pc.csv's "
@@ -451,8 +454,8 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
         encoder_channels=args.encoder_channels,
         encoder_layers=args.encoder_layers,
         pooling_type=args.pooling_type,
-        collapse_regularization=args.collapse_regularization,
         sparsify_density=args.sparsify_density,
+        assign_dropout=args.assign_dropout,
     )
     model = model.to(device=device)
 

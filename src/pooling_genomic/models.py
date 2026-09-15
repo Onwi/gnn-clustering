@@ -502,13 +502,22 @@ class DiffPoolLayer(nn.Module):
         Full mode only: prune the pooled output adjacency to this fraction
         of edges per node (see ``_build_pooled_output_graph``) instead of
         leaving it fully connected.
+    assign_dropout : float
+        Dropout applied to the raw assignment logits before the softmax.
+        Tsitsulin et al. (DMoN paper, JMLR 2023) use 0.5 here and report it
+        specifically prevents gradient descent from getting stuck in a
+        degenerate assignment -- applied to both pooling types (not just
+        DMoN) to avoid introducing a new architectural asymmetry between
+        them, consistent with keeping everything else about the two
+        assignment heads identical.
     """
     def __init__(self, in_channels: int, hidden_channels: int, max_clusters: int, K: int = 2,
-                 sparsify_density: Optional[float] = None):
+                 sparsify_density: Optional[float] = None, assign_dropout: float = 0.5):
         super().__init__()
         self.embed_gnn = ChebConv(in_channels, hidden_channels, K=K)
         self.pool_gnn = ChebConv(in_channels, max_clusters, K=K)
         self.sparsify_density = sparsify_density
+        self.assign_dropout = assign_dropout
         self._coarse_edge_index: Optional[torch.Tensor] = None
         self._coarse_edge_weight: Optional[torch.Tensor] = None
         self._parents: Optional[torch.Tensor] = None
@@ -550,6 +559,7 @@ class DiffPoolLayer(nn.Module):
         k = _compute_pool_k(n, min_nodes, self.pool_gnn.out_channels)
 
         s_raw = self.pool_gnn(x, edge_index, edge_weight=edge_weight)
+        s_raw = F.dropout(s_raw, p=self.assign_dropout, training=self.training)
         S = F.softmax(s_raw[:, :, :k], dim=-1)
 
         # Pool features: X' = S^T Z
@@ -626,16 +636,24 @@ class DMoNLayer(nn.Module):
         Upper bound on the number of clusters this layer can produce.
     K : int
         Chebyshev filter order.
-    collapse_regularization : float
-        Weight of the collapse-regularization term relative to the
-        modularity term (the paper's single DMoN hyperparameter, typically
-        ~1.0). This is folded into the returned 'collapse_loss' so an outer
-        lambda_collapse only needs to scale the whole term against the
-        classification loss.
     sparsify_density : float, optional
         Full mode only: prune the pooled output adjacency to this fraction
         of edges per node (see ``_build_pooled_output_graph``) instead of
         leaving it fully connected.
+    assign_dropout : float
+        Dropout applied to the raw assignment logits before the softmax.
+        Tsitsulin et al. (DMoN paper, JMLR 2023) use 0.5 here and report it
+        specifically prevents gradient descent from getting stuck in a
+        degenerate assignment -- applied to both pooling types (not just
+        DMoN) to avoid introducing a new architectural asymmetry between
+        them.
+
+    Note: there used to be a separate ``collapse_regularization`` parameter
+    here, a fixed multiplier on ``collapse_loss``. It was removed --
+    mathematically redundant with the outer, independently-tuned
+    ``lambda_collapse`` (both linearly scale the same term with nothing
+    else combining them, so searching over both adds no expressiveness
+    beyond what ``lambda_collapse`` alone already covers).
     """
     def __init__(
         self,
@@ -643,14 +661,14 @@ class DMoNLayer(nn.Module):
         hidden_channels: int,
         max_clusters: int,
         K: int = 2,
-        collapse_regularization: float = 1.0,
         sparsify_density: Optional[float] = None,
+        assign_dropout: float = 0.5,
     ):
         super().__init__()
         self.embed_gnn = ChebConv(in_channels, hidden_channels, K=K)
         self.pool_gnn = ChebConv(in_channels, max_clusters, K=K)
-        self.collapse_regularization = collapse_regularization
         self.sparsify_density = sparsify_density
+        self.assign_dropout = assign_dropout
         self._coarse_edge_index: Optional[torch.Tensor] = None
         self._coarse_edge_weight: Optional[torch.Tensor] = None
         self._parents: Optional[torch.Tensor] = None
@@ -692,6 +710,7 @@ class DMoNLayer(nn.Module):
         k = _compute_pool_k(n, min_nodes, self.pool_gnn.out_channels)
 
         c_raw = self.pool_gnn(x, edge_index, edge_weight=edge_weight)
+        c_raw = F.dropout(c_raw, p=self.assign_dropout, training=self.training)
         C = F.softmax(c_raw[:, :, :k], dim=-1)
 
         # Pool features: X' = C^T Z
@@ -742,7 +761,7 @@ class DMoNLayer(nn.Module):
 
         aux = {
             'modularity_loss': modularity_loss,
-            'collapse_loss': self.collapse_regularization * collapse_loss,
+            'collapse_loss': collapse_loss,
         }
 
         # --- output graph (full mode: extract sparse edges from pooled adjacency) ---
@@ -853,11 +872,12 @@ class DiffPoolGNN(nn.Module):
       ``max_clusters`` in a single hop.
 
     ``pooling_type`` selects the assignment-learning mechanism used by every
-    layer's full-mode (learned) branch: ``'diffpool'`` (default, link
+    layer's learned-assignment branch: ``'diffpool'`` (default, link
     prediction + entropy losses) or ``'dmon'`` (Deep Modularity Networks,
-    modularity + collapse-regularization losses -- see ``DMoNLayer``).
-    Hybrid-mode levels behave identically either way, since they never reach
-    the learned branch.
+    modularity + collapse-regularization losses -- see ``DMoNLayer``). Both
+    apply ``assign_dropout`` to their raw assignment logits before the
+    softmax (Tsitsulin et al., DMoN paper, JMLR 2023) whenever that branch
+    is reached, hybrid mode's trailing layer included.
     """
     def __init__(
         self,
@@ -875,8 +895,8 @@ class DiffPoolGNN(nn.Module):
         encoder_channels: int = 16,
         encoder_layers: int = 2,
         pooling_type: str = 'diffpool',
-        collapse_regularization: float = 1.0,
         sparsify_density: Optional[float] = None,
+        assign_dropout: float = 0.5,
     ):
         super().__init__()
         self.max_filters = max_filters
@@ -921,7 +941,7 @@ class DiffPoolGNN(nn.Module):
             parents_list = []
 
         LayerClass = DMoNLayer if pooling_type == 'dmon' else DiffPoolLayer
-        layer_extra_kwargs = {'collapse_regularization': collapse_regularization} if pooling_type == 'dmon' else {}
+        layer_extra_kwargs = {'assign_dropout': assign_dropout}
         if full_mode:
             layer_extra_kwargs['sparsify_density'] = sparsify_density
 
@@ -979,8 +999,8 @@ def build_diffpool_model(
     encoder_channels: int = 16,
     encoder_layers: int = 2,
     pooling_type: str = 'diffpool',
-    collapse_regularization: float = 1.0,
     sparsify_density: Optional[float] = None,
+    assign_dropout: float = 0.5,
     **kwargs,
 ):
     """Build a DiffPool- or DMoN-based hierarchical pooling classifier.
@@ -1020,14 +1040,16 @@ def build_diffpool_model(
         (see ``DiffPoolGNN`` / ``_compute_cluster_schedule``).
     pooling_type : str
         ``'diffpool'`` (default) or ``'dmon'`` -- see ``DiffPoolGNN``.
-    collapse_regularization : float
-        DMoN-only: weight of the collapse term relative to modularity
-        within each layer (ignored when ``pooling_type='diffpool'``).
     sparsify_density : float, optional
         Full mode only: prune each level's pooled output adjacency to this
         fraction of edges per node instead of leaving it fully connected
         (see ``_build_pooled_output_graph``). ``None`` (default) disables
         pruning, matching prior behavior.
+    assign_dropout : float
+        Dropout applied to each layer's raw assignment logits before the
+        softmax, whenever the learned-assignment branch is reached (both
+        pooling types, hybrid mode's trailing layer included). Default 0.5
+        matches Tsitsulin et al. (DMoN paper, JMLR 2023).
     """
     gnn_model = DiffPoolGNN(
         base_edge_index=base_graph.edge_index,
@@ -1044,8 +1066,8 @@ def build_diffpool_model(
         encoder_channels=encoder_channels,
         encoder_layers=encoder_layers,
         pooling_type=pooling_type,
-        collapse_regularization=collapse_regularization,
         sparsify_density=sparsify_density,
+        assign_dropout=assign_dropout,
     )
 
     if full_mode:

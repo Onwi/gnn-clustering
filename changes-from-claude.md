@@ -5,6 +5,87 @@ Each entry: what changed, why, files touched, and how it was verified.
 
 ---
 
+## 5. Assignment-head dropout (from the DMoN paper) + remove redundant collapse_regularization (2026-09-15)
+
+Found reading the actual DMoN paper (Tsitsulin, Palowitch, Perozzi, Muller, "Graph Clustering with
+Graph Neural Networks", JMLR 2023, arXiv:2006.16904) end to end and cross-checking it against every
+file on the DMoN path, ahead of the `n_hybrid=5` Hybrid DMoN run (`scripts/run_hybrid_n5_dmon_full3.sh`).
+Two of several findings were judged worth acting on now; a third (the paper's fixed 1:1
+modularity:collapse weighting vs. this codebase's independently-tuned `lambda_modularity`/
+`lambda_collapse`) was deliberately left alone -- our own tuned configs already found ratios far
+from 1:1 (e.g. one run: `lambda_modularity=0.028` vs `lambda_collapse=6.34`), and constraining the
+search now, right before the matched DiffPool-vs-DMoN comparison, would both risk making the best
+achievable config worse (removing flexibility this task may genuinely need, given it differs from
+the paper's pure-unsupervised-clustering setting) and confound the n_hybrid=5 result with a second,
+untested change. A fourth (matching the paper's trainable-skip-connection + SeLU GCN layer in place
+of `ChebConv`+ReLU) was explicitly declined -- too large an architecture change for this pass.
+
+### 5a. Added assignment-head dropout
+
+**Problem:** the paper's assignment head is `C = softmax(GCN(...))` with **0.5 dropout on the GNN
+representation before the softmax**, and states this specifically prevents "gradient descent from
+getting stuck" in a degenerate assignment. Neither `DiffPoolLayer` nor `DMoNLayer` had any dropout
+anywhere in the pooling path -- only the final `FCModel` classifier head had dropout.
+
+**Fix:** added an `assign_dropout` parameter (default 0.5, matching the paper) to both layer
+classes, applied via `F.dropout` to the raw assignment logits (`s_raw`/`c_raw`) immediately before
+the softmax. Applied to **both** pooling types, not just DMoN, and to hybrid mode's trailing layer
+too (it reaches the same learned-assignment branch) -- to avoid introducing a new architectural
+asymmetry between DiffPool and DMoN that wasn't there before, consistent with this investigation's
+running principle of keeping the two pooling types on identical architectural footing so any
+difference in outcome isolates the loss family. Threaded through `DiffPoolGNN.__init__` (added to
+`layer_extra_kwargs` unconditionally, not gated by `full_mode`, unlike `sparsify_density`) and
+`build_diffpool_model()`, plus a new `--assign-dropout` CLI flag.
+
+### 5b. Removed the redundant `collapse_regularization` parameter
+
+**Problem:** already identified as a loose end in fix #4's era but not acted on then.
+`collapse_regularization` (a fixed multiplier on `collapse_loss`, default 1.0) and the outer,
+independently-tuned `lambda_collapse` both linearly scale the exact same term with nothing else
+combining them -- `lambda_collapse * collapse_regularization * collapse_loss` is mathematically
+just `(lambda_collapse * collapse_regularization) * collapse_loss`, a single effective scalar.
+Tuning both adds no search expressiveness beyond what `lambda_collapse` alone already covers.
+
+**Fix:** removed `collapse_regularization` entirely from `DMoNLayer`, `DiffPoolGNN.__init__`,
+`build_diffpool_model()`, and the `--collapse-regularization` CLI flag. `DMoNLayer`'s
+`collapse_loss` is now returned unscaled; `lambda_collapse` (already tuned) is the only remaining
+knob on that term.
+
+### Files changed
+
+- `src/pooling_genomic/models.py`
+  - `DiffPoolLayer`/`DMoNLayer`: added `assign_dropout` param + `F.dropout` call before softmax;
+    removed `collapse_regularization` from `DMoNLayer` (param, `self.` attribute, and its multiply
+    in the returned `aux` dict).
+  - `DiffPoolGNN.__init__`, `build_diffpool_model()`: added `assign_dropout` param (unconditional,
+    both modes); removed `collapse_regularization` param; docstrings updated.
+- `scripts/experiments/diffpool_experiment.py`: added `--assign-dropout` CLI flag (default 0.5),
+  threaded into both `build_diffpool_model(...)` call sites; removed `--collapse-regularization`
+  and its two pass-throughs.
+
+### Verification
+
+Using the `pooling_genomic` conda env:
+
+1. `python3 -m py_compile` on both changed files; confirmed `--collapse-regularization` no longer
+   appears in `--help` output and no remaining code references to `collapse_regularization` outside
+   an explanatory docstring note.
+2. End-to-end, all 4 combinations of `pooling_type in {diffpool, dmon}` x `full_mode in {True,
+   False}` on a synthetic 200-node graph: `model.train()` forward + backward produces no NaN
+   gradients; `model.eval()` forward is fully deterministic across repeated calls on the same
+   input (confirms dropout correctly disables during evaluation, so test/final metrics aren't
+   corrupted by dropout noise).
+
+### Not addressed by this change (deliberately, see above)
+
+- The paper's fixed 1:1 modularity:collapse weighting vs. this codebase's independently-tuned
+  `lambda_modularity`/`lambda_collapse` -- left as a candidate follow-up ablation with spare
+  compute, not bundled into the upcoming `n_hybrid=5` Hybrid DMoN comparison.
+- The paper's trainable-skip-connection + SeLU GCN layer, in place of the current `ChebConv` + ReLU
+  -- explicitly declined as too large an architecture change for this pass.
+
+---
+
 ## 4. Three small correctness/cleanliness fixes found reviewing Full DMoN and adjacent code (2026-09-10)
 
 Found while re-reading the full Full DMoN implementation end to end, looking for further
