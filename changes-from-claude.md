@@ -5,6 +5,69 @@ Each entry: what changed, why, files touched, and how it was verified.
 
 ---
 
+## 6. Three findings from a `/code-review` pass on recent commits (2026-09-16)
+
+Found by a code-review agent reviewing the last several commits, all independently verified
+before fixing.
+
+### 6a. ASHA pruning silently disabled again for `--n-cycles` 1 or 2
+
+**Problem:** `run_holdout()`'s `grace_n_cycles = max(tune_n_cycles - 1, 1)` floors to 1 whenever
+`tune_n_cycles` is already 1 (i.e. `--n-cycles` <= 2), making `grace_period == max_t` -- the exact
+"ASHA never prunes early" no-op that this whole block's comment says it exists to avoid, silently
+reintroduced via a different path than the original bug.
+
+**Fix:** made the "no room for an earlier boundary" case explicit instead of falling through the
+same `max(..., 1)` floor as the normal case: when `tune_n_cycles <= 1` (tuning budget is already a
+single epoch, so there genuinely is no earlier restart boundary to prune at), skip `ASHAScheduler`
+entirely and pass `scheduler=None` to `build_tuner`, with a printed warning explaining why -- so the
+log says plainly that no pruning is happening at this budget, instead of constructing a scheduler
+that looks active but isn't.
+
+**Files changed:** `scripts/experiments/diffpool_experiment.py` (`run_holdout()`).
+
+**Verification:** `python3 -m py_compile`; checked `tune_max_epochs`/`grace_period` for
+`--n-cycles` in `{1, 2, 3, 5, 7}` -- `1`/`2` now hit the `scheduler=None` branch (previously both
+computed `grace_period == tune_max_epochs == 1`, silently); `3`/`5`/`7` are unaffected
+(`grace_period` 1/7/31 vs. `max_t` 3/15/63, matching pre-fix values exactly).
+
+### 6b. `_config_key()` collided between Hybrid and Full-mode runs of the same pooling type
+
+**Problem:** `scripts/analysis_v2/parsers.py`'s `_config_key()` builds `{prefix}_H{n_hybrid}_R{rep}`
+using only `pooling_type`, `n_hybrid`, and `rep` -- never `full_mode`, even though the row-loading
+code captures it. `diffpool_hybrid5_rep0` and `diffpool_full5_rep0` both key to `"DP_H5_R0"`;
+`load_all_predictions`/`load_all_outputs` (dicts keyed by this) silently drop one run's data when
+both are parsed together -- which is now a real scenario (`outputs/hybrid_n5_diffpool` alongside
+`outputs/full_dmon_shrunk`).
+
+**Fix:** added a mode letter (`"H"`/`"F"`) derived from `row["full_mode"]`, giving
+`diffpool_hybrid5_rep0` -> `DP_H5_R0` and `diffpool_full5_rep0` -> `DP_F5_R0`.
+
+**Files changed:** `scripts/analysis_v2/parsers.py` (`_config_key()`).
+
+**Verification:** `python3 -m py_compile`; constructed synthetic hybrid/full rows with identical
+`pooling_type`/`n_hybrid`/`rep` and confirmed `_config_key()` now returns distinct strings for them.
+
+### 6c. `ARCHITECTURE.md` documented a `--collapse-regularization` flag that no longer exists
+
+**Problem:** fix #5b (above) removed the `--collapse-regularization` CLI flag entirely, but
+`ARCHITECTURE.md`'s DMoN section still told readers to tune it -- following that doc would hit an
+argparse "unrecognized arguments" error.
+
+**Fix:** corrected the sentence to describe only the two flags that actually exist
+(`--lambda-modularity`/`--lambda-collapse`), with a brief note on why the removed flag was
+redundant (matching the explanation already correct in `HYBRID_DMON.md` and this changelog's own
+fix #5b, which the review agent didn't flag as stale).
+
+**Files changed:** `ARCHITECTURE.md`.
+
+**Verification:** grepped the repo's `.md`/`.MD` files for remaining `--collapse-regularization`
+mentions -- only `changes-from-claude.md` (historical, correct) and `HYBRID_DMON.md` (already
+correctly described as removed) remain; confirmed `--collapse-regularization` doesn't appear in
+`diffpool_experiment.py --help` output.
+
+---
+
 ## 5. Assignment-head dropout (from the DMoN paper) + remove redundant collapse_regularization (2026-09-15)
 
 Found reading the actual DMoN paper (Tsitsulin, Palowitch, Perozzi, Muller, "Graph Clustering with

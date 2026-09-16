@@ -632,21 +632,39 @@ def run_holdout(args, random_state, rep):
         # ends up comparing noise instead of converged validation loss.
         tune_n_cycles = max(args.n_cycles - 1, 1)
         tune_max_epochs = _cosine_restart_epochs(1, 2, tune_n_cycles)
-        # grace_period at the *previous* restart boundary rather than at
-        # max_t, so ASHA gets one real pruning checkpoint instead of none
-        # (grace_period == max_t means no trial is ever pruned early). The
-        # 2^n-1 restart sequence's consecutive-boundary ratio converges to
-        # reduction_factor=2 as n grows (3, 2.33, 2.14, 2.07, 2.03, ...), so
-        # the rung Ray computes automatically (max_t / reduction_factor)
-        # lands within ~1 epoch of this boundary -- still a converged
-        # trough, not a mid-cycle read.
-        grace_n_cycles = max(tune_n_cycles - 1, 1)
-        grace_period = _cosine_restart_epochs(1, 2, grace_n_cycles)
-        scheduler = ASHAScheduler(
-            max_t=tune_max_epochs,
-            grace_period=grace_period,
-            reduction_factor=2,
-        )
+        if tune_n_cycles > 1:
+            # grace_period at the *previous* restart boundary rather than at
+            # max_t, so ASHA gets one real pruning checkpoint instead of none
+            # (grace_period == max_t means no trial is ever pruned early). The
+            # 2^n-1 restart sequence's consecutive-boundary ratio converges to
+            # reduction_factor=2 as n grows (3, 2.33, 2.14, 2.07, 2.03, ...), so
+            # the rung Ray computes automatically (max_t / reduction_factor)
+            # lands within ~1 epoch of this boundary -- still a converged
+            # trough, not a mid-cycle read.
+            grace_n_cycles = tune_n_cycles - 1
+            grace_period = _cosine_restart_epochs(1, 2, grace_n_cycles)
+            scheduler = ASHAScheduler(
+                max_t=tune_max_epochs,
+                grace_period=grace_period,
+                reduction_factor=2,
+            )
+        else:
+            # tune_n_cycles == 1 -> tune_max_epochs == 1 epoch: there is no
+            # earlier restart boundary to use as a grace_period, so early
+            # pruning isn't meaningful at this budget (every trial gets
+            # exactly one epoch before being judged regardless). Previously
+            # this fell through to grace_n_cycles = max(tune_n_cycles - 1, 1)
+            # == 1, silently reconstructing grace_period == max_t -- the
+            # exact "ASHA never prunes" no-op this whole block exists to
+            # avoid, just via a different path. Skip ASHA outright instead so
+            # the log says plainly that no pruning is happening, rather than
+            # constructing a scheduler that looks active but isn't.
+            print(
+                f"WARNING: --n-cycles={args.n_cycles} gives a {tune_max_epochs}-epoch "
+                "tuning budget -- too small for any early-stopping rung. Running "
+                "without ASHA pruning (every trial runs to completion)."
+            )
+            scheduler = None
         trainable = partial(
             train_and_validate_model, args=args, n_hybrid=n_hybrid,
             random_state=random_state, indices_loader=indices_loader
