@@ -122,18 +122,18 @@ def format_loss_std(mean, std):
     return f"{mean:.4f} +/- {std:.4f}"
 
 
-def build_report(diffpool, dmon, durations, n_holdouts):
+def build_report(diffpool, dmon, durations, n_hybrid, n_holdouts, notes):
     lines = []
     lines.append("# Hybrid DiffPool vs Hybrid DMoN -- comparison\n")
     lines.append(
-        "Matched config on both runs: `--n-hybrid 2 --n-hybrid-start 2 --tune "
-        "--num-samples 16 --n-cycles 7 --batch-size 96 --gpu-per-trial 1 "
-        f"--cpu-per-trial 8 --n-holdouts {n_holdouts} --use-train-set-weights` -- "
-        "only `--pooling-type` (and its pooling-type-specific lambda search "
-        "space) differs between the two runs. Machine: 24GB RTX 3090 Ti "
-        "(batch size 96 empirically validated, see scripts/run_hybrid_rerun.sh "
-        f"header). Metrics below are mean +/- std across {n_holdouts} holdout "
-        "rep(s) (each rep tunes its own hyperparameters independently).\n"
+        f"Matched config on both runs: `--n-hybrid {n_hybrid} --n-hybrid-start {n_hybrid} "
+        f"--n-holdouts {n_holdouts}` -- only `--pooling-type` (and its pooling-type-specific "
+        "lambda search space) differs between the two runs; other flags (num_samples, "
+        "n_cycles, batch size, hardware) are whatever the launching script used and aren't "
+        "recorded in the output directories themselves, so aren't asserted here"
+        + (f" -- {notes}" if notes else "") + ". "
+        f"Metrics below are mean +/- std across {n_holdouts} holdout rep(s) (each rep tunes "
+        "its own hyperparameters independently).\n"
     )
 
     lines.append("## Results\n")
@@ -208,6 +208,11 @@ def main():
                         help="Number of holdout reps to load and aggregate (mean +/- std)")
     parser.add_argument("--log", type=str, default=None, help="Path to a log containing HYBRID_RERUN_TIMER markers")
     parser.add_argument("--out", type=str, default=None, help="Output .md path (default: <path-output>/comparison.md)")
+    parser.add_argument("--notes", type=str, default=None,
+                        help="Free-text note describing the actual config/hardware this run used "
+                             "(batch size, num_samples, GPU, etc.) -- not derivable from the output "
+                             "directories, so the launching script should pass it explicitly rather "
+                             "than leaving the report to assert an unverified config.")
     args = parser.parse_args()
 
     path_output = Path(args.path_output)
@@ -215,7 +220,7 @@ def main():
     dmon = load_and_aggregate(path_output, "dmon", args.n_hybrid, args.n_holdouts)
     durations = parse_log_durations(Path(args.log)) if args.log else {}
 
-    report = build_report(diffpool, dmon, durations, args.n_holdouts)
+    report = build_report(diffpool, dmon, durations, args.n_hybrid, args.n_holdouts, args.notes)
 
     out_path = Path(args.out) if args.out else path_output / "comparison.md"
     out_path.parent.mkdir(parents=True, exist_ok=True)
