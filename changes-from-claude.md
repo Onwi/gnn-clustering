@@ -5,7 +5,82 @@ Each entry: what changed, why, files touched, and how it was verified.
 
 ---
 
-## 6. Three findings from a `/code-review` pass on recent commits (2026-09-16)
+## 7. Fixed Ray Tune checkpointing (never actually saved model weights) + warm-start the final retrain (2026-09-19)
+
+### Problem
+
+The Hybrid DMoN `n_hybrid=5` full 3-rep run (`outputs/hybrid_n5_dmon_full3`) finished with rep0 at
+4.34% test accuracy (near/below the 6.25% random floor for 16 classes) while rep1 and rep2 reached
+82.70% and 81.27%. Inspecting rep0's final-retrain metrics showed the model collapsed to a frozen
+uniform-16-class prediction (`test_loss` pinned at `2.772` -- `ln(16) = 2.7726` almost exactly) by
+epoch ~10 of 127, and never moved again despite multiple cosine-annealing LR restarts.
+
+Crucially, rep0's *winning hyperparameters* (`lr=0.0087, weight_decay=0.0513,
+lambda_modularity=0.057, lambda_collapse=0.203`) reached **83.2% validation accuracy** during their
+own tuning trial -- so the collapse wasn't a bad hyperparameter draw. Tracing `train_and_test_model`
+found the real cause: it builds a *fresh* model (`build_diffpool_model(...)`, new random init) for
+the final retrain rather than continuing from the tuning trial that found `config`. The same
+hyperparameters that converged well from one random init landed in a degenerate basin from a
+different one.
+
+The natural fix -- warm-start the final retrain from the winning trial's own checkpoint -- turned up
+a second, larger bug underneath: `train_and_validate_model`'s checkpoint block computed a save path
+(`with tune.checkpoint_dir(epoch) as checkpoint_dir: path = str(Path(checkpoint_dir) / "checkpoint")`)
+but never actually wrote anything to it. Every checkpoint directory ever produced by any tuning run
+in this repo contained only Ray's own `.is_checkpoint`/`.tune_metadata` bookkeeping files -- zero
+model weights, confirmed by inspecting a completed checkpoint directly. `train_and_test_model`
+always retrained from scratch not by choice but because there was never a real checkpoint available
+to warm-start from.
+
+### Fix
+
+- `train_and_validate_model`: added the missing `torch.save(model.state_dict(), path)` inside the
+  checkpoint block, so `path` (already computed, already reported to Ray Tune via
+  `tune.report(checkpoint=checkpoint_dir)`) actually contains the epoch's model weights. Ray's
+  `CheckpointConfig(checkpoint_score_attribute="accuracy", num_to_keep=1)` already retains only the
+  best-accuracy epoch's checkpoint per trial, matching `get_best_result(scope="all")`'s own
+  selection -- no change needed there.
+- `train_and_test_model`: after building the fresh model, loads `best_result.checkpoint`'s saved
+  state dict into it (`checkpoint.as_directory()` + `torch.load(.../"checkpoint")` +
+  `model.load_state_dict(...)`) before the final-retrain loop, instead of training purely from
+  scratch. Falls back to the fresh random init with a printed warning if no checkpoint is present or
+  loading fails -- e.g. `results` loaded from a run that predates this fix, where every checkpoint is
+  empty by construction (this is what lets `scripts/recover_hybrid_n5_diffpool.py`-style recovery
+  from old runs keep working without crashing).
+
+Note: `model.state_dict()` includes the two registered buffers (`base_edge_index`/`base_edge_weight`
+-- the full base graph, ~150MB+ for the real 8.16M-edge PPI graph), so each kept checkpoint is
+correspondingly large (~164MB in the test below). Harmless (buffers are identical between the saved
+and freshly-built model, so loading is still correct) but worth knowing before being surprised by
+`ray_results` disk usage on a run with many tuning samples.
+
+### Files changed
+
+- `scripts/experiments/diffpool_experiment.py`: `train_and_validate_model()` (actually save the
+  checkpoint), `train_and_test_model()` (load it as a warm start, with a fallback).
+
+### Verification
+
+Using the `pooling_genomic` conda env:
+
+1. Inspected a checkpoint directory from the completed (pre-fix) `hybrid_n5_dmon_full3` run directly
+   -- confirmed it contains only `.is_checkpoint`/`.tune_metadata`, no model weights, reproducing the
+   bug's root cause.
+2. Ran a real end-to-end integration test (`--pooling-type dmon --n-hybrid 5 --tune --num-samples 2
+   --n-cycles 2 --n-holdouts 1`, tiny budget, real data/graph): both tuning trials logged
+   `should_checkpoint: true`; the final retrain printed `"Warm-started final retrain from best
+   trial's checkpoint: checkpoint"` with no errors, and proceeded into its training loop.
+3. Loaded the saved checkpoint file directly with `torch.load` -- a valid `OrderedDict` with 47
+   tensors including real model weights (e.g. `0.diffpool_layers.0.embed_gnn.bias`, shape `(2,)`),
+   164MB (dominated by the two large graph buffers, see note above), confirming the save path
+   produces genuinely loadable state, not just a plausible-looking log line.
+
+### Not addressed by this change
+
+- rep0 of `outputs/hybrid_n5_dmon_full3` was not rerun as part of this fix -- it's a real result from
+  the pre-fix code, left as-is; a rerun with this fix would very plausibly warm-start into the same
+  basin the tuning trial found (83%+) instead of collapsing, but that's a separate decision, not
+  bundled into this fix.
 
 Found by a code-review agent reviewing the last several commits, all independently verified
 before fixing.

@@ -235,6 +235,19 @@ def train_and_validate_model(
         if using_ray_tune:
             with tune.checkpoint_dir(epoch) as checkpoint_dir:
                 path = str(Path(checkpoint_dir) / "checkpoint")
+                # This used to compute `path` and never write to it -- every
+                # checkpoint Ray Tune tracked across every run in this repo
+                # was an empty directory (only Ray's own `.is_checkpoint`/
+                # `.tune_metadata` bookkeeping files, no model weights). That
+                # silently made `train_and_test_model`'s final retrain always
+                # start from a fresh random init, with no way to warm-start
+                # from the tuning trial that found these hyperparameters --
+                # see changes-from-claude.md fix #7 for the failure this
+                # caused (Hybrid DMoN n_hybrid=5 rep0: the exact hyperparameters
+                # that reached 83.2% val accuracy during tuning collapsed to a
+                # frozen uniform-16-class prediction on an independent re-init
+                # during the final retrain).
+                torch.save(model.state_dict(), path)
             tune.report(
                 loss=val_loss,
                 accuracy=accuracy,
@@ -458,6 +471,35 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
         assign_dropout=args.assign_dropout,
     )
     model = model.to(device=device)
+
+    # Warm-start from the tuning trial's own best-epoch checkpoint instead of
+    # training from a fresh random init with the same hyperparameters. Without
+    # this, the final retrain re-rolls initialization independently of the
+    # tuning phase that selected `config` -- these hyperparameters are only
+    # known to work from *that* trial's specific init; a different init can
+    # land in a materially different basin (see changes-from-claude.md fix #7:
+    # this exact failure mode collapsed a Hybrid DMoN n_hybrid=5 rep to a
+    # frozen uniform-class prediction despite its hyperparameters reaching
+    # 83.2% val accuracy during tuning). Falls back to the fresh init (with a
+    # warning) if no checkpoint is available -- e.g. results loaded from a
+    # run predating this fix, where every checkpoint directory is empty.
+    checkpoint = best_result.checkpoint
+    if checkpoint is not None:
+        try:
+            with checkpoint.as_directory() as checkpoint_dir:
+                state_dict_path = Path(checkpoint_dir) / "checkpoint"
+                state_dict = torch.load(state_dict_path, map_location=device)
+                model.load_state_dict(state_dict)
+            print(f"Warm-started final retrain from best trial's checkpoint: {state_dict_path.name}")
+        except (FileNotFoundError, RuntimeError) as e:
+            print(
+                f"WARNING: could not warm-start from best trial's checkpoint ({e}) -- "
+                "falling back to a fresh random init. If this run predates "
+                "changes-from-claude.md fix #7, every checkpoint from it is "
+                "empty by construction; this is expected, not a new bug."
+            )
+    else:
+        print("WARNING: best trial has no checkpoint -- training final retrain from a fresh random init.")
 
     class_weights = None
     try:
