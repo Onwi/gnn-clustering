@@ -19,7 +19,7 @@ from pooling_genomic.engines import train_epoch_clf, evaluate_clf
 from pooling_genomic.utils import plot_confusion_matrix, savefig, write_json
 
 
-def build_data_loaders(*args, batch_size, num_workers, device='cpu'):
+def build_data_loaders(*args, batch_size, num_workers, device='cpu', shuffle=True):
     loaders = []
     pin_memory = True if 'cuda' in device else False
     for dataset in args:
@@ -27,7 +27,7 @@ def build_data_loaders(*args, batch_size, num_workers, device='cpu'):
         dataset_loader = DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=shuffle,
             num_workers=num_workers,
             drop_last=drop_last,
             pin_memory=pin_memory,
@@ -152,9 +152,15 @@ def train_and_validate_model(
     train_set, val_set, test_set, dataset = get_genomic_classification_dataset(
         path_dataset=path_dataset, **dataset_kwargs
     )
-    train_loader, val_loader = build_data_loaders(
-        train_set, val_set, batch_size=batch_size, num_workers=num_workers, device=device
-    )
+    train_loader = build_data_loaders(
+        train_set, batch_size=batch_size, num_workers=num_workers, device=device, shuffle=True
+    )[0]
+    # shuffle=False: validation order only matters for ensembling downstream
+    # (test set, not val), but keeping this deterministic too costs nothing
+    # and removes one source of run-to-run non-reproducibility.
+    val_loader = build_data_loaders(
+        val_set, batch_size=batch_size, num_workers=num_workers, device=device, shuffle=False
+    )[0]
     output_dims = dataset.get_n_classes()
 
     # ---- graph ----
@@ -235,6 +241,19 @@ def train_and_validate_model(
         if using_ray_tune:
             with tune.checkpoint_dir(epoch) as checkpoint_dir:
                 path = str(Path(checkpoint_dir) / "checkpoint")
+                # This used to compute `path` and never write to it -- every
+                # checkpoint Ray Tune tracked across every run in this repo
+                # was an empty directory (only Ray's own `.is_checkpoint`/
+                # `.tune_metadata` bookkeeping files, no model weights). That
+                # silently made `train_and_test_model`'s final retrain always
+                # start from a fresh random init, with no way to warm-start
+                # from the tuning trial that found these hyperparameters --
+                # see changes-from-claude.md fix #7 for the failure this
+                # caused (Hybrid DMoN n_hybrid=5 rep0: the exact hyperparameters
+                # that reached 83.2% val accuracy during tuning collapsed to a
+                # frozen uniform-16-class prediction on an independent re-init
+                # during the final retrain).
+                torch.save(model.state_dict(), path)
             tune.report(
                 loss=val_loss,
                 accuracy=accuracy,
@@ -250,8 +269,12 @@ def train_and_validate_model(
 
     # ---- final test + save (non-tuning path) ----
     if not using_ray_tune:
+        # shuffle=False: deterministic row order in the saved outputs.csv,
+        # required for cross-rep prediction ensembling (see
+        # changes-from-claude.md fix #8) to average the right patients
+        # together instead of whatever order each run happened to shuffle to.
         test_loader = build_data_loaders(
-            test_set, batch_size=batch_size, num_workers=num_workers, device=device
+            test_set, batch_size=batch_size, num_workers=num_workers, device=device, shuffle=False
         )[0]
         test_metrics, (test_outputs, test_labels) = evaluate_clf(
             model=model, validation_loader=test_loader, device=device,
@@ -353,6 +376,14 @@ def parse_args():
     parser.add_argument("--n-cycles", type=int, default=5)
     parser.add_argument("--path-output", type=str, default="./outputs")
     parser.add_argument("--n-holdouts", type=int, default=5)
+    parser.add_argument("--shared-test-split", action="store_true",
+                        help="Use one shared random_state (one fixed train/val/test patient "
+                             "split) across all --n-holdouts reps, instead of a different split "
+                             "per rep. Required for cross-rep prediction ensembling to be valid "
+                             "(reps must share the same test patients) -- otherwise each rep is "
+                             "an independent repeated-holdout resample with its own test set, "
+                             "good for a variance estimate but not ensembling. Reps still differ "
+                             "via independent hyperparameter search and model initialization.")
     parser.add_argument("--path-indices", type=str, default=None)
     parser.add_argument("--cohort-indices", type=str, default=None)
     parser.add_argument("--use-train-set-weights", action="store_true")
@@ -418,9 +449,14 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
         path_dataset=path_dataset, **dataset_kwargs
     )
     train_set = torch.utils.data.ConcatDataset([train_set, val_set])
-    train_loader, test_loader = build_data_loaders(
-        train_set, test_set, batch_size=batch_size, num_workers=num_workers, device=device
-    )
+    train_loader = build_data_loaders(
+        train_set, batch_size=batch_size, num_workers=num_workers, device=device, shuffle=True
+    )[0]
+    # shuffle=False: same reasoning as the non-tuning path above -- required
+    # for cross-rep prediction ensembling to be valid at all.
+    test_loader = build_data_loaders(
+        test_set, batch_size=batch_size, num_workers=num_workers, device=device, shuffle=False
+    )[0]
     output_dims = dataset.get_n_classes()
 
     genes = dataset.get_genes()
@@ -458,6 +494,35 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
         assign_dropout=args.assign_dropout,
     )
     model = model.to(device=device)
+
+    # Warm-start from the tuning trial's own best-epoch checkpoint instead of
+    # training from a fresh random init with the same hyperparameters. Without
+    # this, the final retrain re-rolls initialization independently of the
+    # tuning phase that selected `config` -- these hyperparameters are only
+    # known to work from *that* trial's specific init; a different init can
+    # land in a materially different basin (see changes-from-claude.md fix #7:
+    # this exact failure mode collapsed a Hybrid DMoN n_hybrid=5 rep to a
+    # frozen uniform-class prediction despite its hyperparameters reaching
+    # 83.2% val accuracy during tuning). Falls back to the fresh init (with a
+    # warning) if no checkpoint is available -- e.g. results loaded from a
+    # run predating this fix, where every checkpoint directory is empty.
+    checkpoint = best_result.checkpoint
+    if checkpoint is not None:
+        try:
+            with checkpoint.as_directory() as checkpoint_dir:
+                state_dict_path = Path(checkpoint_dir) / "checkpoint"
+                state_dict = torch.load(state_dict_path, map_location=device)
+                model.load_state_dict(state_dict)
+            print(f"Warm-started final retrain from best trial's checkpoint: {state_dict_path.name}")
+        except (FileNotFoundError, RuntimeError) as e:
+            print(
+                f"WARNING: could not warm-start from best trial's checkpoint ({e}) -- "
+                "falling back to a fresh random init. If this run predates "
+                "changes-from-claude.md fix #7, every checkpoint from it is "
+                "empty by construction; this is expected, not a new bug."
+            )
+    else:
+        print("WARNING: best trial has no checkpoint -- training final retrain from a fresh random init.")
 
     class_weights = None
     try:
@@ -632,21 +697,39 @@ def run_holdout(args, random_state, rep):
         # ends up comparing noise instead of converged validation loss.
         tune_n_cycles = max(args.n_cycles - 1, 1)
         tune_max_epochs = _cosine_restart_epochs(1, 2, tune_n_cycles)
-        # grace_period at the *previous* restart boundary rather than at
-        # max_t, so ASHA gets one real pruning checkpoint instead of none
-        # (grace_period == max_t means no trial is ever pruned early). The
-        # 2^n-1 restart sequence's consecutive-boundary ratio converges to
-        # reduction_factor=2 as n grows (3, 2.33, 2.14, 2.07, 2.03, ...), so
-        # the rung Ray computes automatically (max_t / reduction_factor)
-        # lands within ~1 epoch of this boundary -- still a converged
-        # trough, not a mid-cycle read.
-        grace_n_cycles = max(tune_n_cycles - 1, 1)
-        grace_period = _cosine_restart_epochs(1, 2, grace_n_cycles)
-        scheduler = ASHAScheduler(
-            max_t=tune_max_epochs,
-            grace_period=grace_period,
-            reduction_factor=2,
-        )
+        if tune_n_cycles > 1:
+            # grace_period at the *previous* restart boundary rather than at
+            # max_t, so ASHA gets one real pruning checkpoint instead of none
+            # (grace_period == max_t means no trial is ever pruned early). The
+            # 2^n-1 restart sequence's consecutive-boundary ratio converges to
+            # reduction_factor=2 as n grows (3, 2.33, 2.14, 2.07, 2.03, ...), so
+            # the rung Ray computes automatically (max_t / reduction_factor)
+            # lands within ~1 epoch of this boundary -- still a converged
+            # trough, not a mid-cycle read.
+            grace_n_cycles = tune_n_cycles - 1
+            grace_period = _cosine_restart_epochs(1, 2, grace_n_cycles)
+            scheduler = ASHAScheduler(
+                max_t=tune_max_epochs,
+                grace_period=grace_period,
+                reduction_factor=2,
+            )
+        else:
+            # tune_n_cycles == 1 -> tune_max_epochs == 1 epoch: there is no
+            # earlier restart boundary to use as a grace_period, so early
+            # pruning isn't meaningful at this budget (every trial gets
+            # exactly one epoch before being judged regardless). Previously
+            # this fell through to grace_n_cycles = max(tune_n_cycles - 1, 1)
+            # == 1, silently reconstructing grace_period == max_t -- the
+            # exact "ASHA never prunes" no-op this whole block exists to
+            # avoid, just via a different path. Skip ASHA outright instead so
+            # the log says plainly that no pruning is happening, rather than
+            # constructing a scheduler that looks active but isn't.
+            print(
+                f"WARNING: --n-cycles={args.n_cycles} gives a {tune_max_epochs}-epoch "
+                "tuning budget -- too small for any early-stopping rung. Running "
+                "without ASHA pruning (every trial runs to completion)."
+            )
+            scheduler = None
         trainable = partial(
             train_and_validate_model, args=args, n_hybrid=n_hybrid,
             random_state=random_state, indices_loader=indices_loader
@@ -670,10 +753,25 @@ def main():
 
     n_holdouts = args.n_holdouts
     rng = np.random.default_rng(seed=123)
-    for rep in range(n_holdouts):
+    if args.shared_test_split:
+        # One random_state for every rep -- get_genomic_classification_dataset
+        # uses random_state to shuffle the *entire* dataset before slicing
+        # train/val/test positionally, so a different random_state per rep
+        # (the default below) gives each rep a different set of test patients,
+        # which makes cross-rep prediction ensembling meaningless (nothing to
+        # average -- see changes-from-claude.md fix #8). With a single shared
+        # random_state, all reps see the same train/val/test patient split;
+        # the reps still differ via independent hyperparameter search and
+        # model initialization, same as before.
         random_state = int(rng.integers(500))
-        print("random state ", random_state)
-        run_holdout(args=args, random_state=random_state, rep=rep)
+        print(f"random state (shared across all {n_holdouts} reps): ", random_state)
+        for rep in range(n_holdouts):
+            run_holdout(args=args, random_state=random_state, rep=rep)
+    else:
+        for rep in range(n_holdouts):
+            random_state = int(rng.integers(500))
+            print("random state ", random_state)
+            run_holdout(args=args, random_state=random_state, rep=rep)
 
 
 if __name__ == "__main__":

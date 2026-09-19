@@ -109,4 +109,9 @@ def _config_key(row) -> str:
     if row["model"] == "Fixed HEM":
         return f"HEM_L{row['n_levels']}_W{row['weighted_pooling']}_C{row['use_convs']}_R{row['rep']}"
     prefix = "DMoN" if row.get("pooling_type") == "dmon" else "DP"
-    return f"{prefix}_H{row['n_hybrid']}_R{row['rep']}"
+    # mode letter distinguishes Hybrid ("H") from Full ("F") runs of the same
+    # pooling_type/n_hybrid/rep -- without it, e.g. diffpool_hybrid5_rep0 and
+    # diffpool_full5_rep0 both key to "DP_H5_R0"/"DP_5_R0" and one silently
+    # overwrites the other in load_all_predictions/load_all_outputs.
+    mode = "F" if row.get("full_mode") else "H"
+    return f"{prefix}_{mode}{row['n_hybrid']}_R{row['rep']}"

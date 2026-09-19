@@ -5,6 +5,213 @@ Each entry: what changed, why, files touched, and how it was verified.
 
 ---
 
+## 8. Shared-test-split protocol option + cross-rep prediction ensembling (2026-09-19)
+
+### Problem / motivation
+
+Trying to squeeze more accuracy out of Hybrid DiffPool/DMoN beyond `n_hybrid=5`'s ~81-84%,
+ensembling the 3 holdout reps' predictions was a natural next thing to try (it's normally close to
+free accuracy). But the existing holdout protocol makes this meaningless as-is:
+`get_genomic_classification_dataset` uses `random_state` to shuffle the *entire* dataset before
+slicing train/val/test positionally, and `main()` draws a **different** `random_state` per rep --
+so each rep's test set contains different patients. There's nothing to average across reps when the
+reps don't share the same test examples.
+
+Fixing that also surfaced a second problem: even with a shared test set, `build_data_loaders`
+always builds every loader with `shuffle=True`, including the test loader -- so two runs evaluating
+the *same* test set would still write `outputs.csv` rows in a different order each time, making
+naive row-position averaging silently wrong (averaging predictions for different patients together).
+
+### Fix
+
+- **`build_data_loaders`**: added a `shuffle` parameter (default `True`, preserving existing
+  behavior). Train loaders still shuffle; val/test loaders across all three call sites
+  (`train_and_validate_model`'s non-tuning path, and `train_and_test_model`'s final retrain) now
+  pass `shuffle=False`, making `outputs.csv` row order deterministic and consistent across
+  independent runs of the same underlying dataset/split.
+- **New `--shared-test-split` CLI flag** (default off, preserving the existing repeated-holdout
+  protocol as the default): when set, `main()` draws one `random_state` and reuses it for every rep
+  instead of drawing a fresh one per rep, so all reps share the same train/val/test patient split.
+  Reps still differ via independent hyperparameter search and model initialization -- this is a
+  standard "shared split, independently-trained members" ensemble design, not just training the
+  same thing 3 times.
+- **New `scripts/analysis/ensemble_predictions.py`**: loads each rep's `outputs.csv` (raw per-class
+  logits + labels, already written by `analyze_final_model_results`), verifies every rep's labels
+  match in the same order (hard-fails with a clear message if not -- e.g. if `--shared-test-split`
+  wasn't actually used), averages per-rep **softmax** probabilities (not raw logits -- the standard,
+  scale-robust ensembling choice) across reps, and reports the ensembled accuracy/balanced accuracy
+  alongside each individual rep's own numbers.
+
+This is opt-in and additive: existing results (`hybrid_rerun2`, `hybrid_n5_diffpool_full3`,
+`hybrid_n5_dmon_full3`, ...) are unaffected, since none used `--shared-test-split`, and the default
+CLI behavior is unchanged.
+
+### Files changed
+
+- `scripts/experiments/diffpool_experiment.py`: `build_data_loaders()` (new `shuffle` param), its
+  three call sites (val/test now `shuffle=False`), `main()` (`--shared-test-split` branch), new
+  `--shared-test-split` CLI flag.
+- `scripts/analysis/ensemble_predictions.py`: new file.
+
+### Verification
+
+Using the `pooling_genomic` conda env:
+
+1. `python3 -m py_compile`; confirmed `--shared-test-split` appears in `--help` output.
+2. `ensemble_predictions.py` correctness, on synthetic data: 3 fake "reps" with independently noisy
+   logits biased toward the correct class with increasing probability (60%/78%/84% individual
+   accuracy) ensembled to **96%** accuracy -- the expected direction and rough magnitude for
+   averaging independent, better-than-chance classifiers.
+3. `ensemble_predictions.py` safety check: constructed two reps with deliberately different labels
+   (simulating a run *without* `--shared-test-split`, or misaligned output order) and confirmed the
+   script hard-fails with a clear message identifying which rep mismatched, rather than silently
+   averaging predictions for different patients.
+
+### Not addressed by this change
+
+- No existing run used `--shared-test-split`, so no historical result can be retroactively
+  ensembled -- this only applies going forward.
+
+---
+
+## 7. Fixed Ray Tune checkpointing (never actually saved model weights) + warm-start the final retrain (2026-09-19)
+
+### Problem
+
+The Hybrid DMoN `n_hybrid=5` full 3-rep run (`outputs/hybrid_n5_dmon_full3`) finished with rep0 at
+4.34% test accuracy (near/below the 6.25% random floor for 16 classes) while rep1 and rep2 reached
+82.70% and 81.27%. Inspecting rep0's final-retrain metrics showed the model collapsed to a frozen
+uniform-16-class prediction (`test_loss` pinned at `2.772` -- `ln(16) = 2.7726` almost exactly) by
+epoch ~10 of 127, and never moved again despite multiple cosine-annealing LR restarts.
+
+Crucially, rep0's *winning hyperparameters* (`lr=0.0087, weight_decay=0.0513,
+lambda_modularity=0.057, lambda_collapse=0.203`) reached **83.2% validation accuracy** during their
+own tuning trial -- so the collapse wasn't a bad hyperparameter draw. Tracing `train_and_test_model`
+found the real cause: it builds a *fresh* model (`build_diffpool_model(...)`, new random init) for
+the final retrain rather than continuing from the tuning trial that found `config`. The same
+hyperparameters that converged well from one random init landed in a degenerate basin from a
+different one.
+
+The natural fix -- warm-start the final retrain from the winning trial's own checkpoint -- turned up
+a second, larger bug underneath: `train_and_validate_model`'s checkpoint block computed a save path
+(`with tune.checkpoint_dir(epoch) as checkpoint_dir: path = str(Path(checkpoint_dir) / "checkpoint")`)
+but never actually wrote anything to it. Every checkpoint directory ever produced by any tuning run
+in this repo contained only Ray's own `.is_checkpoint`/`.tune_metadata` bookkeeping files -- zero
+model weights, confirmed by inspecting a completed checkpoint directly. `train_and_test_model`
+always retrained from scratch not by choice but because there was never a real checkpoint available
+to warm-start from.
+
+### Fix
+
+- `train_and_validate_model`: added the missing `torch.save(model.state_dict(), path)` inside the
+  checkpoint block, so `path` (already computed, already reported to Ray Tune via
+  `tune.report(checkpoint=checkpoint_dir)`) actually contains the epoch's model weights. Ray's
+  `CheckpointConfig(checkpoint_score_attribute="accuracy", num_to_keep=1)` already retains only the
+  best-accuracy epoch's checkpoint per trial, matching `get_best_result(scope="all")`'s own
+  selection -- no change needed there.
+- `train_and_test_model`: after building the fresh model, loads `best_result.checkpoint`'s saved
+  state dict into it (`checkpoint.as_directory()` + `torch.load(.../"checkpoint")` +
+  `model.load_state_dict(...)`) before the final-retrain loop, instead of training purely from
+  scratch. Falls back to the fresh random init with a printed warning if no checkpoint is present or
+  loading fails -- e.g. `results` loaded from a run that predates this fix, where every checkpoint is
+  empty by construction (this is what lets `scripts/recover_hybrid_n5_diffpool.py`-style recovery
+  from old runs keep working without crashing).
+
+Note: `model.state_dict()` includes the two registered buffers (`base_edge_index`/`base_edge_weight`
+-- the full base graph, ~150MB+ for the real 8.16M-edge PPI graph), so each kept checkpoint is
+correspondingly large (~164MB in the test below). Harmless (buffers are identical between the saved
+and freshly-built model, so loading is still correct) but worth knowing before being surprised by
+`ray_results` disk usage on a run with many tuning samples.
+
+### Files changed
+
+- `scripts/experiments/diffpool_experiment.py`: `train_and_validate_model()` (actually save the
+  checkpoint), `train_and_test_model()` (load it as a warm start, with a fallback).
+
+### Verification
+
+Using the `pooling_genomic` conda env:
+
+1. Inspected a checkpoint directory from the completed (pre-fix) `hybrid_n5_dmon_full3` run directly
+   -- confirmed it contains only `.is_checkpoint`/`.tune_metadata`, no model weights, reproducing the
+   bug's root cause.
+2. Ran a real end-to-end integration test (`--pooling-type dmon --n-hybrid 5 --tune --num-samples 2
+   --n-cycles 2 --n-holdouts 1`, tiny budget, real data/graph): both tuning trials logged
+   `should_checkpoint: true`; the final retrain printed `"Warm-started final retrain from best
+   trial's checkpoint: checkpoint"` with no errors, and proceeded into its training loop.
+3. Loaded the saved checkpoint file directly with `torch.load` -- a valid `OrderedDict` with 47
+   tensors including real model weights (e.g. `0.diffpool_layers.0.embed_gnn.bias`, shape `(2,)`),
+   164MB (dominated by the two large graph buffers, see note above), confirming the save path
+   produces genuinely loadable state, not just a plausible-looking log line.
+
+### Not addressed by this change
+
+- rep0 of `outputs/hybrid_n5_dmon_full3` was not rerun as part of this fix -- it's a real result from
+  the pre-fix code, left as-is; a rerun with this fix would very plausibly warm-start into the same
+  basin the tuning trial found (83%+) instead of collapsing, but that's a separate decision, not
+  bundled into this fix.
+
+Found by a code-review agent reviewing the last several commits, all independently verified
+before fixing.
+
+### 6a. ASHA pruning silently disabled again for `--n-cycles` 1 or 2
+
+**Problem:** `run_holdout()`'s `grace_n_cycles = max(tune_n_cycles - 1, 1)` floors to 1 whenever
+`tune_n_cycles` is already 1 (i.e. `--n-cycles` <= 2), making `grace_period == max_t` -- the exact
+"ASHA never prunes early" no-op that this whole block's comment says it exists to avoid, silently
+reintroduced via a different path than the original bug.
+
+**Fix:** made the "no room for an earlier boundary" case explicit instead of falling through the
+same `max(..., 1)` floor as the normal case: when `tune_n_cycles <= 1` (tuning budget is already a
+single epoch, so there genuinely is no earlier restart boundary to prune at), skip `ASHAScheduler`
+entirely and pass `scheduler=None` to `build_tuner`, with a printed warning explaining why -- so the
+log says plainly that no pruning is happening at this budget, instead of constructing a scheduler
+that looks active but isn't.
+
+**Files changed:** `scripts/experiments/diffpool_experiment.py` (`run_holdout()`).
+
+**Verification:** `python3 -m py_compile`; checked `tune_max_epochs`/`grace_period` for
+`--n-cycles` in `{1, 2, 3, 5, 7}` -- `1`/`2` now hit the `scheduler=None` branch (previously both
+computed `grace_period == tune_max_epochs == 1`, silently); `3`/`5`/`7` are unaffected
+(`grace_period` 1/7/31 vs. `max_t` 3/15/63, matching pre-fix values exactly).
+
+### 6b. `_config_key()` collided between Hybrid and Full-mode runs of the same pooling type
+
+**Problem:** `scripts/analysis_v2/parsers.py`'s `_config_key()` builds `{prefix}_H{n_hybrid}_R{rep}`
+using only `pooling_type`, `n_hybrid`, and `rep` -- never `full_mode`, even though the row-loading
+code captures it. `diffpool_hybrid5_rep0` and `diffpool_full5_rep0` both key to `"DP_H5_R0"`;
+`load_all_predictions`/`load_all_outputs` (dicts keyed by this) silently drop one run's data when
+both are parsed together -- which is now a real scenario (`outputs/hybrid_n5_diffpool` alongside
+`outputs/full_dmon_shrunk`).
+
+**Fix:** added a mode letter (`"H"`/`"F"`) derived from `row["full_mode"]`, giving
+`diffpool_hybrid5_rep0` -> `DP_H5_R0` and `diffpool_full5_rep0` -> `DP_F5_R0`.
+
+**Files changed:** `scripts/analysis_v2/parsers.py` (`_config_key()`).
+
+**Verification:** `python3 -m py_compile`; constructed synthetic hybrid/full rows with identical
+`pooling_type`/`n_hybrid`/`rep` and confirmed `_config_key()` now returns distinct strings for them.
+
+### 6c. `ARCHITECTURE.md` documented a `--collapse-regularization` flag that no longer exists
+
+**Problem:** fix #5b (above) removed the `--collapse-regularization` CLI flag entirely, but
+`ARCHITECTURE.md`'s DMoN section still told readers to tune it -- following that doc would hit an
+argparse "unrecognized arguments" error.
+
+**Fix:** corrected the sentence to describe only the two flags that actually exist
+(`--lambda-modularity`/`--lambda-collapse`), with a brief note on why the removed flag was
+redundant (matching the explanation already correct in `HYBRID_DMON.md` and this changelog's own
+fix #5b, which the review agent didn't flag as stale).
+
+**Files changed:** `ARCHITECTURE.md`.
+
+**Verification:** grepped the repo's `.md`/`.MD` files for remaining `--collapse-regularization`
+mentions -- only `changes-from-claude.md` (historical, correct) and `HYBRID_DMON.md` (already
+correctly described as removed) remain; confirmed `--collapse-regularization` doesn't appear in
+`diffpool_experiment.py --help` output.
+
+---
+
 ## 5. Assignment-head dropout (from the DMoN paper) + remove redundant collapse_regularization (2026-09-15)
 
 Found reading the actual DMoN paper (Tsitsulin, Palowitch, Perozzi, Muller, "Graph Clustering with
