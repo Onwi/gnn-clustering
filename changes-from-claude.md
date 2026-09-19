@@ -5,6 +5,75 @@ Each entry: what changed, why, files touched, and how it was verified.
 
 ---
 
+## 8. Shared-test-split protocol option + cross-rep prediction ensembling (2026-09-19)
+
+### Problem / motivation
+
+Trying to squeeze more accuracy out of Hybrid DiffPool/DMoN beyond `n_hybrid=5`'s ~81-84%,
+ensembling the 3 holdout reps' predictions was a natural next thing to try (it's normally close to
+free accuracy). But the existing holdout protocol makes this meaningless as-is:
+`get_genomic_classification_dataset` uses `random_state` to shuffle the *entire* dataset before
+slicing train/val/test positionally, and `main()` draws a **different** `random_state` per rep --
+so each rep's test set contains different patients. There's nothing to average across reps when the
+reps don't share the same test examples.
+
+Fixing that also surfaced a second problem: even with a shared test set, `build_data_loaders`
+always builds every loader with `shuffle=True`, including the test loader -- so two runs evaluating
+the *same* test set would still write `outputs.csv` rows in a different order each time, making
+naive row-position averaging silently wrong (averaging predictions for different patients together).
+
+### Fix
+
+- **`build_data_loaders`**: added a `shuffle` parameter (default `True`, preserving existing
+  behavior). Train loaders still shuffle; val/test loaders across all three call sites
+  (`train_and_validate_model`'s non-tuning path, and `train_and_test_model`'s final retrain) now
+  pass `shuffle=False`, making `outputs.csv` row order deterministic and consistent across
+  independent runs of the same underlying dataset/split.
+- **New `--shared-test-split` CLI flag** (default off, preserving the existing repeated-holdout
+  protocol as the default): when set, `main()` draws one `random_state` and reuses it for every rep
+  instead of drawing a fresh one per rep, so all reps share the same train/val/test patient split.
+  Reps still differ via independent hyperparameter search and model initialization -- this is a
+  standard "shared split, independently-trained members" ensemble design, not just training the
+  same thing 3 times.
+- **New `scripts/analysis/ensemble_predictions.py`**: loads each rep's `outputs.csv` (raw per-class
+  logits + labels, already written by `analyze_final_model_results`), verifies every rep's labels
+  match in the same order (hard-fails with a clear message if not -- e.g. if `--shared-test-split`
+  wasn't actually used), averages per-rep **softmax** probabilities (not raw logits -- the standard,
+  scale-robust ensembling choice) across reps, and reports the ensembled accuracy/balanced accuracy
+  alongside each individual rep's own numbers.
+
+This is opt-in and additive: existing results (`hybrid_rerun2`, `hybrid_n5_diffpool_full3`,
+`hybrid_n5_dmon_full3`, ...) are unaffected, since none used `--shared-test-split`, and the default
+CLI behavior is unchanged.
+
+### Files changed
+
+- `scripts/experiments/diffpool_experiment.py`: `build_data_loaders()` (new `shuffle` param), its
+  three call sites (val/test now `shuffle=False`), `main()` (`--shared-test-split` branch), new
+  `--shared-test-split` CLI flag.
+- `scripts/analysis/ensemble_predictions.py`: new file.
+
+### Verification
+
+Using the `pooling_genomic` conda env:
+
+1. `python3 -m py_compile`; confirmed `--shared-test-split` appears in `--help` output.
+2. `ensemble_predictions.py` correctness, on synthetic data: 3 fake "reps" with independently noisy
+   logits biased toward the correct class with increasing probability (60%/78%/84% individual
+   accuracy) ensembled to **96%** accuracy -- the expected direction and rough magnitude for
+   averaging independent, better-than-chance classifiers.
+3. `ensemble_predictions.py` safety check: constructed two reps with deliberately different labels
+   (simulating a run *without* `--shared-test-split`, or misaligned output order) and confirmed the
+   script hard-fails with a clear message identifying which rep mismatched, rather than silently
+   averaging predictions for different patients.
+
+### Not addressed by this change
+
+- No existing run used `--shared-test-split`, so no historical result can be retroactively
+  ensembled -- this only applies going forward.
+
+---
+
 ## 7. Fixed Ray Tune checkpointing (never actually saved model weights) + warm-start the final retrain (2026-09-19)
 
 ### Problem

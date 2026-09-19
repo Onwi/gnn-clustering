@@ -19,7 +19,7 @@ from pooling_genomic.engines import train_epoch_clf, evaluate_clf
 from pooling_genomic.utils import plot_confusion_matrix, savefig, write_json
 
 
-def build_data_loaders(*args, batch_size, num_workers, device='cpu'):
+def build_data_loaders(*args, batch_size, num_workers, device='cpu', shuffle=True):
     loaders = []
     pin_memory = True if 'cuda' in device else False
     for dataset in args:
@@ -27,7 +27,7 @@ def build_data_loaders(*args, batch_size, num_workers, device='cpu'):
         dataset_loader = DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=shuffle,
             num_workers=num_workers,
             drop_last=drop_last,
             pin_memory=pin_memory,
@@ -152,9 +152,15 @@ def train_and_validate_model(
     train_set, val_set, test_set, dataset = get_genomic_classification_dataset(
         path_dataset=path_dataset, **dataset_kwargs
     )
-    train_loader, val_loader = build_data_loaders(
-        train_set, val_set, batch_size=batch_size, num_workers=num_workers, device=device
-    )
+    train_loader = build_data_loaders(
+        train_set, batch_size=batch_size, num_workers=num_workers, device=device, shuffle=True
+    )[0]
+    # shuffle=False: validation order only matters for ensembling downstream
+    # (test set, not val), but keeping this deterministic too costs nothing
+    # and removes one source of run-to-run non-reproducibility.
+    val_loader = build_data_loaders(
+        val_set, batch_size=batch_size, num_workers=num_workers, device=device, shuffle=False
+    )[0]
     output_dims = dataset.get_n_classes()
 
     # ---- graph ----
@@ -263,8 +269,12 @@ def train_and_validate_model(
 
     # ---- final test + save (non-tuning path) ----
     if not using_ray_tune:
+        # shuffle=False: deterministic row order in the saved outputs.csv,
+        # required for cross-rep prediction ensembling (see
+        # changes-from-claude.md fix #8) to average the right patients
+        # together instead of whatever order each run happened to shuffle to.
         test_loader = build_data_loaders(
-            test_set, batch_size=batch_size, num_workers=num_workers, device=device
+            test_set, batch_size=batch_size, num_workers=num_workers, device=device, shuffle=False
         )[0]
         test_metrics, (test_outputs, test_labels) = evaluate_clf(
             model=model, validation_loader=test_loader, device=device,
@@ -366,6 +376,14 @@ def parse_args():
     parser.add_argument("--n-cycles", type=int, default=5)
     parser.add_argument("--path-output", type=str, default="./outputs")
     parser.add_argument("--n-holdouts", type=int, default=5)
+    parser.add_argument("--shared-test-split", action="store_true",
+                        help="Use one shared random_state (one fixed train/val/test patient "
+                             "split) across all --n-holdouts reps, instead of a different split "
+                             "per rep. Required for cross-rep prediction ensembling to be valid "
+                             "(reps must share the same test patients) -- otherwise each rep is "
+                             "an independent repeated-holdout resample with its own test set, "
+                             "good for a variance estimate but not ensembling. Reps still differ "
+                             "via independent hyperparameter search and model initialization.")
     parser.add_argument("--path-indices", type=str, default=None)
     parser.add_argument("--cohort-indices", type=str, default=None)
     parser.add_argument("--use-train-set-weights", action="store_true")
@@ -431,9 +449,14 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
         path_dataset=path_dataset, **dataset_kwargs
     )
     train_set = torch.utils.data.ConcatDataset([train_set, val_set])
-    train_loader, test_loader = build_data_loaders(
-        train_set, test_set, batch_size=batch_size, num_workers=num_workers, device=device
-    )
+    train_loader = build_data_loaders(
+        train_set, batch_size=batch_size, num_workers=num_workers, device=device, shuffle=True
+    )[0]
+    # shuffle=False: same reasoning as the non-tuning path above -- required
+    # for cross-rep prediction ensembling to be valid at all.
+    test_loader = build_data_loaders(
+        test_set, batch_size=batch_size, num_workers=num_workers, device=device, shuffle=False
+    )[0]
     output_dims = dataset.get_n_classes()
 
     genes = dataset.get_genes()
@@ -730,10 +753,25 @@ def main():
 
     n_holdouts = args.n_holdouts
     rng = np.random.default_rng(seed=123)
-    for rep in range(n_holdouts):
+    if args.shared_test_split:
+        # One random_state for every rep -- get_genomic_classification_dataset
+        # uses random_state to shuffle the *entire* dataset before slicing
+        # train/val/test positionally, so a different random_state per rep
+        # (the default below) gives each rep a different set of test patients,
+        # which makes cross-rep prediction ensembling meaningless (nothing to
+        # average -- see changes-from-claude.md fix #8). With a single shared
+        # random_state, all reps see the same train/val/test patient split;
+        # the reps still differ via independent hyperparameter search and
+        # model initialization, same as before.
         random_state = int(rng.integers(500))
-        print("random state ", random_state)
-        run_holdout(args=args, random_state=random_state, rep=rep)
+        print(f"random state (shared across all {n_holdouts} reps): ", random_state)
+        for rep in range(n_holdouts):
+            run_holdout(args=args, random_state=random_state, rep=rep)
+    else:
+        for rep in range(n_holdouts):
+            random_state = int(rng.integers(500))
+            print("random state ", random_state)
+            run_holdout(args=args, random_state=random_state, rep=rep)
 
 
 if __name__ == "__main__":
