@@ -84,7 +84,7 @@ def parse_log_durations(log_path: Path):
     {pooling_type: seconds}. Returns {} if the log or markers aren't found."""
     if log_path is None or not log_path.exists():
         return {}
-    text = log_path.read_text()
+    text = log_path.read_text(errors="replace")
     durations = {}
     for pooling_type in ("diffpool", "dmon"):
         start_m = re.search(rf"HYBRID_RERUN_TIMER {pooling_type} start (\d+)", text)

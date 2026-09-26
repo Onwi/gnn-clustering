@@ -47,8 +47,14 @@ cd "$REPO_ROOT"
 echo "Repo root: $REPO_ROOT"
 
 # Edit this if the pre-flight probe below OOMs on the target machine.
-BATCH_SIZE=32
-CPU_PER_TRIAL=4
+# Bumped from the RTX 3060 defaults (batch=32, cpu=4) this script was
+# originally calibrated for -- this run is on MARCS (RTX 3090 Ti, 24GB),
+# where batch=96/cpu=8 was already validated safe and fast (~30s/epoch) for
+# n_hybrid=5 via the DiffPool counterpart run. Est. ~22h total instead of
+# the original ~75h estimate. The pre-flight probe below still re-validates
+# this before committing to the full run, regardless.
+BATCH_SIZE=96
+CPU_PER_TRIAL=8
 
 if ! command -v conda >/dev/null 2>&1; then
   echo "ERROR: conda not found on PATH." >&2
