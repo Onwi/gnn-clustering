@@ -5,6 +5,38 @@ Each entry: what changed, why, files touched, and how it was verified.
 
 ---
 
+## 10. Three minor cleanups found reviewing Full DMoN (2026-09-25)
+
+Found in a read-only review of the Full DMoN path. None changes accuracy; the third slightly
+changes the *reported* validation/test loss.
+
+1. **`DMoNLayer` collapse loss** (`models.py`): `torch.sqrt(torch.tensor(float(k), device=...))`
+   allocated a fresh GPU tensor on every forward pass for a compile-time constant. Now
+   `math.sqrt(k)`. Numerically identical (checked against the old expression on a real layer).
+2. **Stale numbers in the `_build_pooled_output_graph` docstring** (`models.py`): it justified the
+   ~4% sparsification density with "~11.9M edge rows / 19,385 nodes", which are the raw
+   `stringdb_top100pc.csv` figures (3.2% density). The graph the models load is 8,165,154 edge
+   entries over 14,133 genes (4.09%). Comment corrected; `sparsify_density=0.04` was already right.
+3. **`evaluate_clf` loss averaging** (`engines.py`): the loss was the unweighted mean of per-batch
+   losses, so a short final batch counted as much as a full one (e.g. 7 samples vs 96 at batch 96).
+   It is now weighted by batch size. With unweighted cross-entropy this equals the per-sample mean
+   (verified on a synthetic set with an uneven last batch); with class weights it is a close
+   approximation, since PyTorch normalises each batch by its own summed weights.
+   Also dropped a stale `# break` comment.
+
+**Comparability:** accuracy and balanced accuracy are unaffected. Validation/test *loss* values
+(and hence the loss-based Ray Tune trial ranking) can shift slightly against runs made before this
+change, most for the largest batch sizes. Nothing already run needs redoing.
+
+### Not addressed (found in the same review)
+
+- Full mode builds levels 2-3's graph as the batch mean of per-patient pooled adjacencies, so a
+  prediction depends on its batch companions. To be measured with `final_model.pt` before fixing.
+- Aux losses are summed over levels unnormalised; the collapse term's range (sqrt(k)-1) makes
+  level 1 dominate (42.1 / 14.6 / 4.7 at k = 1854 / 243 / 32).
+
+---
+
 ## 9. Hybrid n=6 results (fixes #7 and #8 validated) + comparison-script log decoding (2026-09-25)
 
 ### What ran

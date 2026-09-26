@@ -464,9 +464,10 @@ def _build_pooled_output_graph(A_next_dense: torch.Tensor, k: int, sparsify_dens
     pruning is per-row). ``sparsify_density`` is a *fraction of this level's
     own width* rather than a fixed edge count, because full-mode levels span
     wildly different widths (e.g. 1854 down to 32 in a 3-level schedule) --
-    a fixed count can't match the base PPI graph's actual density (~4%,
-    measured from stringdb_top100pc.csv: ~11.9M edge rows / 19,385 nodes)
-    at more than one of them simultaneously.
+    a fixed count can't match the base PPI graph's actual density (~4%, as
+    loaded: 8,165,154 edge entries over the 14,133 genes shared with the
+    expression data, i.e. after restricting stringdb_top100pc.csv's 11.9M
+    rows / 19,385 proteins) at more than one of them simultaneously.
     """
     A_mean = A_next_dense.mean(dim=0)
     A_mean = A_mean * (1 - torch.eye(k, device=A_mean.device))
@@ -756,7 +757,7 @@ class DMoNLayer(nn.Module):
         # case where every node is assigned to a single cluster.
         cluster_sizes = C.sum(dim=1)  # (batch, k)
         collapse_loss = (
-            (torch.sqrt(torch.tensor(float(k), device=x.device)) / n) * cluster_sizes.norm(dim=-1) - 1
+            (math.sqrt(k) / n) * cluster_sizes.norm(dim=-1) - 1
         ).mean()
 
         aux = {

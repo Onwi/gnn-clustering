@@ -103,9 +103,8 @@ def evaluate_clf(
     class_predictions = []
     outputs = []
     labels = []
-    iters = len(validation_loader)
     with torch.no_grad():
-        total_loss = 0
+        total_loss, n_samples = 0.0, 0
         for i, batch in enumerate(validation_loader, 0):
             x, t = batch
             x, t = x.to(device), t.to(device)
@@ -117,15 +116,17 @@ def evaluate_clf(
             class_predicted = torch.argmax(y_predicted, dim=1)
             class_predictions.append(class_predicted.detach().cpu().numpy())
             labels.append(t.detach().cpu().numpy())
-            total_loss += loss.detach().cpu().numpy()
-            # break  # remove this break
+            # Weight each batch's mean loss by its size so a short final batch
+            # counts in proportion to its samples, not as much as a full batch.
+            total_loss += float(loss.detach().cpu()) * t.shape[0]
+            n_samples += t.shape[0]
 
     outputs = np.concatenate(outputs, axis=0)
     class_predictions = np.concatenate(class_predictions, axis=0)
     labels = np.concatenate(labels, axis=0)
 
     metrics = {
-        "loss": total_loss / iters,
+        "loss": total_loss / n_samples,
         "balanced_accuracy": balanced_accuracy_score(labels, class_predictions),
         "accuracy": accuracy_score(labels, class_predictions)
     }
