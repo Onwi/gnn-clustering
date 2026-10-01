@@ -212,6 +212,7 @@ def train_and_validate_model(
         pooling_type=args.pooling_type,
         sparsify_density=args.sparsify_density,
         assign_dropout=args.assign_dropout,
+        pool_gnn_layers=args.pool_gnn_layers,
     )
     model = model.to(device=device)
 
@@ -361,6 +362,13 @@ def parse_args():
                              "branch is reached (hybrid mode's trailing layer included). Tsitsulin "
                              "et al. (DMoN paper) use 0.5 and report it specifically prevents "
                              "gradient descent from getting stuck in a degenerate assignment.")
+    parser.add_argument("--pool-gnn-layers", type=int, default=1,
+                        help="Depth of every layer's assignment head (the GNN that produces raw "
+                             "cluster logits, before softmax). Default 1 is a plain single ChebConv, "
+                             "identical to the original code -- a 1-hop view when deciding each "
+                             "node's cluster. A value >1 stacks ReLU-separated ChebConv layers "
+                             "first, giving the assignment decision a wider receptive field before "
+                             "the final projection to --max-clusters.")
     parser.add_argument("--sparsify-density", type=float, default=None,
                         help="Full mode only: prune each level's pooled output adjacency to this "
                              "fraction of edges per node (e.g. 0.04, matching stringdb_top100pc.csv's "
@@ -517,6 +525,7 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
         pooling_type=args.pooling_type,
         sparsify_density=args.sparsify_density,
         assign_dropout=args.assign_dropout,
+        pool_gnn_layers=args.pool_gnn_layers,
     )
     model = model.to(device=device)
 

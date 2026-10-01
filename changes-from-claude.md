@@ -133,6 +133,121 @@ On the real graph (14,133 nodes, 8,165,154 edges) and `levels/`, RTX 3060:
 
 ---
 
+## 13. Four Full DMoN improvement ideas: deeper assignment head, per-level-normalized
+collapse loss, per-patient pooled graphs, wider encoder (2026-10-01)
+
+### Context
+
+Brainstormed after the n=6 fixed-vs-learned comparison (#12 in this file, out of order --
+written before it) showed Fixed HEM beating learned DMoN at matched depth/width. Four ideas to
+improve Full DMoN specifically while keeping it comparable (same bottleneck width, same test
+patients) to that comparison; all four implemented, none launched as a full run yet (see "Next").
+
+### 1. Deeper assignment head (`pool_gnn`)
+
+`pool_gnn` was a single `ChebConv(K=2)`, a 1-hop filter deciding, in one shot, which of up to
+thousands of clusters each node belongs to -- the same "1-hop filter can't see global community
+structure" limitation `plan.md` identified for Full DiffPool generally (`embed_gnn` only has to
+produce good per-node features; `pool_gnn` has to decide a hard partition).
+
+New `PoolAssignmentHead` (`models.py`): stacks `n_layers - 1` ReLU-separated `ChebConv(K=K)`
+layers before the final projection to `max_clusters`, widening the assignment's receptive field
+to `n_layers` hops. `n_layers=1` (new default, via `_build_pool_assignment_head`) stays a **plain,
+unwrapped `ChebConv`** -- bit-identical to the original code, so every existing checkpoint loads
+unchanged (verified: `outputs/full_dmon_shrunk`'s `final_model.pt` loads into a freshly built
+model with `strict=False`, only the already-dead `logit_pool_ratio` keys unexpected). New
+`--pool-gnn-layers` CLI flag (default 1) threads through `DiffPoolLayer`/`DMoNLayer`/
+`DiffPoolGNN`/`build_diffpool_model`.
+
+### 2. Per-level-normalized collapse loss (DMoN only)
+
+The collapse term's range is `sqrt(k) - 1`: at a 3-level, `max_clusters=111` schedule (2809 / 558
+/ 111), that's 52.0 / 22.6 / 9.5 -- level 1 dominates by ~5.5x over level 3, so one shared
+`lambda_collapse` effectively regularizes whichever level has the largest k and barely touches
+the others (plausibly why #12's tuned DMoN lambdas varied so widely across reps with "no
+consistent pattern"). `DMoNLayer.forward` now divides each level's collapse term by its own
+`sqrt(k) - 1` before averaging over the batch, putting every level on the same ~[0, 1] scale.
+Verified: a perfectly balanced synthetic assignment gives collapse_loss ~0 regardless of k (as
+before); a real forward pass gives an in-range value. This changes the loss's absolute scale for
+every DMoN run (hybrid included, though hybrid only ever has one learned level so there is no
+level-dominance problem to fix there) -- any future DMoN rerun needs fresh tuning, not reused
+literal lambda values; tuning (loguniform search) is unaffected since it just re-searches the
+same range under the new scale.
+
+### 3. Wider `PrePoolingEncoder`
+
+No code change -- `--encoder-channels`/`--encoder-layers` already existed. Going from the default
+(16 channels, 2 layers) to 32/3 gives full mode's level-0 pooling decision richer per-gene
+features before its hardest clustering step, at zero cost to comparability (sits before the
+bottleneck entirely).
+
+### 4. Per-patient pooled graphs in full mode (was finding 1 in #10)
+
+**The bug.** `_build_pooled_output_graph` averaged the batch's pooled adjacencies
+(`A_next_dense.mean(dim=0)`) into one shared graph before passing it to the next level, so a
+patient's prediction depended on which other patients happened to share its batch (measured in
+#10: up to ~3.6% of test predictions flipped between batch sizes 1 and 8).
+
+**The fix.** New `_build_pooled_output_graph_batched` builds each sample's own pooled graph (drop
+diagonal, optionally sparsify) and assembles them into one block-diagonal `(edge_index,
+edge_weight)` over `batch_size * k` nodes (sample b's nodes at `[b*k, (b+1)*k)`). New
+`_pool_adjacency_batched` is the per-sample counterpart to `_pool_adjacency` for consuming such a
+graph (per-sample `m`/degree instead of one shared scalar/vector, since each sample's own pooled
+subgraph genuinely has its own edge mass). `DiffPoolLayer`/`DMoNLayer.forward` now auto-detect
+their input's shape (`x.dim() == 3`: one graph shared by the batch, as for the base PPI graph, a
+HEM level, or a hybrid trailing layer -- unchanged; `x.dim() == 2`: block-diagonal, a previous
+full-mode layer's output) and branch accordingly; `DiffPoolGNN.forward` passes `batch_size` and
+`is_last_level` (the last layer in the stack skips building a next-graph entirely, since nothing
+downstream reads it -- true for full mode's last level and for hybrid's sole trailing
+full-assignment layer alike, since it is always structurally the final layer).
+
+**A bug found and fixed while verifying this.** The new per-sample path is the first thing in
+this codebase to ask `torch.sparse.mm`'s CUDA backward to differentiate through sparse-tensor
+*values* that themselves require grad (every existing caller of `_pool_adjacency` only ever
+passes a fixed edge_weight: a registered buffer or precomputed HEM weights). This reproducibly
+crashed with "illegal memory access" a few backward calls into real training on the actual
+14,133-node graph (5/5 random seeds, always forward-ok/backward-crashes, usually by iteration
+3-4) -- a known-unstable path in this PyTorch/CUDA version (1.12.1). Fixed by rewriting
+`_pool_adjacency_batched` with `torch_scatter.scatter` (gather-multiply-scatter) instead of
+`torch.sparse.mm`, matching how this codebase already does its other grad-through-edge-weight
+pooling (the HEM-parents branch). Costs real extra memory (a dense `(num_edges, k+1)` gather
+tensor instead of an internal sparse representation) -- see budget below.
+
+**Verification**
+1. Synthetic batch-independence test (small toy graphs, 2-3 levels): patient 0's output is
+   identical (diff ~5e-7, floating-point noise) whether run alone or batched with 5 others.
+2. Same test on the real graph (14,133 nodes, 3 levels, `max_clusters=111`,
+   `pool_gnn_layers=3`): diff ~3e-5, run alone vs. batched with 2 others.
+3. Hybrid mode (`n_hybrid=2`, DMoN): forward+backward unaffected, confirming the shared-graph
+   branch and HEM-parents branch are both untouched.
+4. `pool_gnn_layers=1` (default): checkpoint-compatibility test above; confirms zero behavior
+   change for every existing config.
+5. The crash above: reproduced on 5/5 seeds pre-fix, 0/5 post-fix (20 iterations each, real graph).
+
+### Budget re-probed with all four combined (real graph, 3 levels, `max_clusters=111`,
+`pool_gnn_layers=3`, `encoder_channels=32`, `encoder_layers=3`, `sparsify_density=0.04`)
+
+| batch | result |
+|---|---|
+| 6, 4, 3 | OOM (wider encoder + deeper assignment head cost real memory; the scatter rewrite costs more still) |
+| **2** | stable (3/3 seeds x 20 iters), 1.87 s/step median, peak 14.6 GB -> ~72 min/epoch pure-step |
+| 1 | fails for an unrelated, pre-existing reason: BatchNorm needs >1 sample per channel while training |
+
+~72 min/epoch (vs. ~65 min for #12's width-matched config without these four changes) at the same
+shrunk-scope budget (6 tuning samples capped at 15 epochs, 31-epoch warm-started retrain, 1 rep)
+projects to roughly the same ballpark, ~3.5-4 days -- not yet launched as a real run.
+
+### Files changed
+
+- `src/pooling_genomic/models.py`: `PoolAssignmentHead`, `_build_pool_assignment_head`,
+  `_pool_adjacency_batched`, `_build_pooled_output_graph_batched`; `DiffPoolLayer`/`DMoNLayer`
+  (`pool_gnn_layers` param, `batch_size`/`is_last_level` forward params, shared-vs-block-diagonal
+  branching, normalized collapse loss); `DiffPoolGNN`/`build_diffpool_model` (`pool_gnn_layers`
+  threaded through, forward loop passes `batch_size`/`is_last_level`).
+- `scripts/experiments/diffpool_experiment.py`: new `--pool-gnn-layers` flag.
+
+---
+
 ## 10. Three minor cleanups found reviewing Full DMoN (2026-09-25)
 
 Found in a read-only review of the Full DMoN path. None changes accuracy; the third slightly
@@ -160,8 +275,9 @@ change, most for the largest batch sizes. Nothing already run needs redoing.
 
 - Full mode builds levels 2-3's graph as the batch mean of per-patient pooled adjacencies, so a
   prediction depends on its batch companions. To be measured with `final_model.pt` before fixing.
+  **Measured and fixed in #13.**
 - Aux losses are summed over levels unnormalised; the collapse term's range (sqrt(k)-1) makes
-  level 1 dominate (42.1 / 14.6 / 4.7 at k = 1854 / 243 / 32).
+  level 1 dominate (42.1 / 14.6 / 4.7 at k = 1854 / 243 / 32). **Fixed in #13.**
 
 ---
 
