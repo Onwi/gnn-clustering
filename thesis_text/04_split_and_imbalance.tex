@@ -1,0 +1,8 @@
+% Data chapter: split sizes and class imbalance.
+% Test counts are for the shared test split (seed 7) used by the n=6 runs.
+The data are split 60/20/20 at the sample level into 4{,}625 training, 1{,}541 validation and
+1{,}543 test samples (Chapter~\ref{chap:setup}); the test samples come from 1{,}521 patients.
+The classes are strongly imbalanced: in the shared test split, the largest class (BRCA) has 250
+samples and the smallest (KICH) has 23, a ratio of about 11 to 1 (about 14 to 1 over the full
+dataset, Table~\ref{tab:class-distribution}), and READ, the class with the lowest F1 in
+Chapter~\ref{chap:results}, has only 32.

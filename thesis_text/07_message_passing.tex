@@ -1,0 +1,17 @@
+% Background: message passing. The generic (phi, bigoplus, psi) form is not Gilmer et al.'s
+% notation (they use a sum, M_t and U_t), so it is attributed to Bronstein et al. as well.
+% Figure: \input{figures/message_passing} (labels m_{uv} defined in the last sentence).
+A graph neural network learns a representation for each node by repeatedly combining its features
+with those of its neighbours. In the message passing framework of \citet{gilmer2017mpnn}, written
+here in the more general form of \citet{bronstein2021geometric} with an arbitrary
+permutation-invariant aggregation $\bigoplus$, layer $l+1$ computes
+\begin{equation}
+h_v^{(l+1)} = \phi\!\left( h_v^{(l)},\; \bigoplus_{u \in \mathcal{N}(v)} \psi\!\left( h_u^{(l)}, h_v^{(l)}, e_{uv} \right) \right),
+\label{eq:mp}
+\end{equation}
+where $h_v^{(l)}$ is the state of node $v$ after $l$ layers, $\mathcal{N}(v)$ its neighbours,
+$e_{uv}$ an optional edge feature, $\psi$ a message function, $\bigoplus$ a permutation-invariant
+aggregation such as a sum or mean, and $\phi$ an update function; we write
+$m_{uv} = \psi\big(h_u^{(l)}, h_v^{(l)}, e_{uv}\big)$ for the message from $u$ to $v$
+(Figure~\ref{fig:mp}). Stacking $L$ layers lets each node receive information from nodes up to $L$
+hops away.

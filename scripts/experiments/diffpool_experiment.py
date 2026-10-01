@@ -12,7 +12,7 @@ from ray import tune, air
 from ray.tune.schedulers import ASHAScheduler
 
 from pooling_genomic.datasets import get_genomic_classification_dataset, PCRunIndicesLoader
-from pooling_genomic.models import build_diffpool_model
+from pooling_genomic.models import build_diffpool_model, FIXED_POOLING_TYPES
 from pooling_genomic.networks import load_coarse_edges_for_diffpool, get_pyg_data
 from pooling_genomic.settings import PoolingGenomicSettings
 from pooling_genomic.engines import train_epoch_clf, evaluate_clf
@@ -44,7 +44,12 @@ def _warn_mismatched_lambda_flags(args):
     instead of leaving a passed flag with no visible effect."""
     diffpool_flags = {'--lambda-link-pred': args.lambda_link_pred, '--lambda-entropy': args.lambda_entropy}
     dmon_flags = {'--lambda-modularity': args.lambda_modularity, '--lambda-collapse': args.lambda_collapse}
-    ignored = dmon_flags if args.pooling_type == 'diffpool' else diffpool_flags
+    if args.pooling_type == 'diffpool':
+        ignored = dmon_flags
+    elif args.pooling_type == 'dmon':
+        ignored = diffpool_flags
+    else:  # fixed-trailing controls have no auxiliary losses at all
+        ignored = {**diffpool_flags, **dmon_flags}
     set_flags = [name for name, val in ignored.items() if val is not None]
     if set_flags:
         print(
@@ -62,6 +67,12 @@ def _cosine_restart_epochs(T_0, T_mult, n_cycles):
     return int(T_0 * (1 - T_mult**n_cycles) / (1 - T_mult))
 
 
+_ZERO_AUX_LAMBDAS = {
+    "lambda_link_pred": 0.0, "lambda_entropy": 0.0,
+    "lambda_modularity": 0.0, "lambda_collapse": 0.0,
+}
+
+
 def build_hp_config(args):
     pooling_type = args.pooling_type
     _warn_mismatched_lambda_flags(args)
@@ -73,7 +84,11 @@ def build_hp_config(args):
             "T_0": 1,
             "T_mult": 2,
         }
-        if pooling_type == "dmon":
+        if pooling_type in FIXED_POOLING_TYPES:
+            # Fixed trailing assignment: no auxiliary losses, so only lr and
+            # weight_decay are tuned.
+            hp_config.update(_ZERO_AUX_LAMBDAS)
+        elif pooling_type == "dmon":
             hp_config["lambda_link_pred"] = 0.0
             hp_config["lambda_entropy"] = 0.0
             # Modularity is bounded in [-0.5, 1] and the collapse term in
@@ -101,7 +116,9 @@ def build_hp_config(args):
             "T_0": 1,
             "T_mult": 2,
         }
-        if pooling_type == "dmon":
+        if pooling_type in FIXED_POOLING_TYPES:
+            hp_config.update(_ZERO_AUX_LAMBDAS)
+        elif pooling_type == "dmon":
             hp_config["lambda_link_pred"] = 0.0
             hp_config["lambda_entropy"] = 0.0
             hp_config["lambda_modularity"] = args.lambda_modularity if args.lambda_modularity is not None else 1.0
@@ -327,11 +344,17 @@ def parse_args():
 
     parser.add_argument("--full-mode", action="store_true",
                         help="Use full learned pooling everywhere (no hybrid levels, no HEM coarse edges)")
-    parser.add_argument("--pooling-type", choices=["diffpool", "dmon"], default="diffpool",
+    parser.add_argument("--pooling-type", choices=["diffpool", "dmon", *FIXED_POOLING_TYPES],
+                        default="diffpool",
                         help="Learned-assignment mechanism used by full-mode pooling levels: "
                              "'diffpool' (link-pred + entropy losses) or 'dmon' (Deep Modularity "
                              "Networks -- modularity + collapse-regularization losses, "
-                             "Tsitsulin et al. 2023). Hybrid levels are unaffected either way.")
+                             "Tsitsulin et al. 2023). Hybrid levels are unaffected either way. "
+                             "Hybrid mode only, as controls against the learned trailing layer: "
+                             "'hem' (one more fixed HEM level), 'spectral' (fixed spectral "
+                             "clustering into --max-clusters groups), 'random' (fixed random "
+                             "partition into --max-clusters groups) -- same model, training and "
+                             "tuning otherwise, no auxiliary losses.")
     parser.add_argument("--assign-dropout", type=float, default=0.5,
                         help="Dropout applied to each layer's raw assignment logits before the "
                              "softmax, for both pooling types, whenever the learned-assignment "
@@ -389,6 +412,8 @@ def parse_args():
     parser.add_argument("--use-train-set-weights", action="store_true")
 
     args = parser.parse_args()
+    if args.full_mode and args.pooling_type in FIXED_POOLING_TYPES:
+        parser.error(f"--pooling-type {args.pooling_type} is a hybrid-mode control; drop --full-mode")
 
     settings = PoolingGenomicSettings()
     if args.path_network is None:

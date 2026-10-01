@@ -1,0 +1,33 @@
+% Data chapter: samples per class. Requires \usepackage{booktabs}.
+% Counts from sample_metadata.csv; "Tumour" = Primary Tumor, "Normal" = Solid Tissue Normal.
+\begin{table}[htbp]
+  \centering
+  \caption{Number of samples per class (TCGA cohort) in the pan-cancer dataset. The 7{,}709
+    samples come from 6{,}991 patients: 704 patients contribute two samples, typically a primary
+    tumour and a matched normal-tissue sample. No patient appears in more than one cohort.}
+  \label{tab:class-distribution}
+  \begin{tabular}{llrrrrr}
+    \toprule
+    Code & Cancer type & Patients & Tumour & Normal & Samples & \% \\
+    \midrule
+    BLCA & Bladder urothelial carcinoma          &   408 &   411 &  19 &   430 &  5.6 \\
+    BRCA & Breast invasive carcinoma             & 1{,}092 & 1{,}097 & 113 & 1{,}210 & 15.7 \\
+    COAD & Colon adenocarcinoma                  &   456 &   469 &  41 &   510 &  6.6 \\
+    ESCA & Oesophageal carcinoma                 &   164 &   161 &  11 &   172 &  2.2 \\
+    HNSC & Head and neck squamous cell carcinoma &   501 &   500 &  44 &   544 &  7.1 \\
+    KICH & Kidney chromophobe                    &    66 &    65 &  24 &    89 &  1.2 \\
+    KIRC & Kidney renal clear cell carcinoma     &   529 &   533 &  72 &   605 &  7.8 \\
+    KIRP & Kidney renal papillary cell carcinoma &   289 &   288 &  32 &   320 &  4.2 \\
+    LIHC & Liver hepatocellular carcinoma        &   371 &   371 &  50 &   421 &  5.5 \\
+    LUAD & Lung adenocarcinoma                   &   515 &   524 &  59 &   583 &  7.6 \\
+    LUSC & Lung squamous cell carcinoma          &   501 &   501 &  49 &   550 &  7.1 \\
+    PRAD & Prostate adenocarcinoma               &   495 &   498 &  52 &   550 &  7.1 \\
+    READ & Rectum adenocarcinoma                 &   167 &   166 &  10 &   176 &  2.3 \\
+    STAD & Stomach adenocarcinoma                &   380 &   375 &  32 &   407 &  5.3 \\
+    THCA & Thyroid carcinoma                     &   502 &   502 &  58 &   560 &  7.3 \\
+    UCEC & Uterine corpus endometrial carcinoma  &   555 &   547 &  35 &   582 &  7.5 \\
+    \midrule
+         & Total                                 & 6{,}991 & 7{,}008 & 701 & 7{,}709 & 100.0 \\
+    \bottomrule
+  \end{tabular}
+\end{table}

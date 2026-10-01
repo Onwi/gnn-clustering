@@ -42,7 +42,7 @@ def parse_all_results(path_output: Path) -> pd.DataFrame:
             continue
 
         # Learned pooling: {diffpool,dmon}_{hybrid,full}{N}_rep{R}
-        m = re.match(r"(diffpool|dmon)_(hybrid|full)(\d+)_rep(\d+)", dirname)
+        m = re.match(r"(diffpool|dmon|hem|spectral|random)_(hybrid|full)(\d+)_rep(\d+)", dirname)
         if m:
             pooling_type, mode_tag, n_hybrid, rep = m.groups()
             model_label = {
@@ -54,6 +54,10 @@ def parse_all_results(path_output: Path) -> pd.DataFrame:
                 ("diffpool", "full"): "Full DiffPool",
                 ("dmon", "hybrid"): "Hybrid DMoN",
                 ("dmon", "full"): "Full DMoN",
+                # fixed-trailing controls (hybrid mode only)
+                ("hem", "hybrid"): "Hybrid HEM-trailing",
+                ("spectral", "hybrid"): "Hybrid Spectral-trailing",
+                ("random", "hybrid"): "Hybrid Random-trailing",
             }[(pooling_type, mode_tag)]
             record = dict(
                 model=model_label,
@@ -108,7 +112,9 @@ def load_all_outputs(df_meta: pd.DataFrame) -> dict:
 def _config_key(row) -> str:
     if row["model"] == "Fixed HEM":
         return f"HEM_L{row['n_levels']}_W{row['weighted_pooling']}_C{row['use_convs']}_R{row['rep']}"
-    prefix = "DMoN" if row.get("pooling_type") == "dmon" else "DP"
+    prefix = {"dmon": "DMoN", "hem": "HEMT", "spectral": "SPEC", "random": "RAND"}.get(
+        row.get("pooling_type"), "DP"
+    )
     # mode letter distinguishes Hybrid ("H") from Full ("F") runs of the same
     # pooling_type/n_hybrid/rep -- without it, e.g. diffpool_hybrid5_rep0 and
     # diffpool_full5_rep0 both key to "DP_H5_R0"/"DP_5_R0" and one silently

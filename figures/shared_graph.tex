@@ -1,0 +1,38 @@
+% Figure: one PPI graph, three patients (node colours = expression).
+% Usage in the thesis: \input{figures/shared_graph}
+% Requires in the preamble: \usepackage{tikz}
+\begin{figure}[t]
+    \centering
+    % #1: x-offset (cm), #2: node colours "i/colour,...", #3: name prefix
+    \newcommand{\ppigraph}[3]{%
+      \begin{scope}[xshift=#1cm]
+        \foreach \i/\x/\y in {1/0/0, 2/0.8/0.7, 3/0.8/-0.7, 4/1.6/0,
+                              5/2.4/0.7, 6/2.4/-0.7, 7/1.6/1.3}
+          \coordinate (#3-\i) at (\x,\y);
+        \foreach \a/\b/\w in {1/2/1.6pt, 1/3/0.4pt, 2/3/0.9pt, 2/4/1.6pt, 3/4/0.4pt,
+                              4/5/0.9pt, 4/6/1.6pt, 5/6/0.4pt, 2/7/0.9pt, 7/5/0.4pt}
+          \draw[black!45, line width=\w] (#3-\a) -- (#3-\b);
+        \foreach \i/\c in {#2}
+          \node[gene, fill=\c] at (#3-\i) {};
+      \end{scope}}
+    \resizebox{0.9\textwidth}{!}{%
+    \begin{tikzpicture}[
+        gene/.style={circle, draw=black!70, minimum size=4.5mm, inner sep=0pt},
+        every node/.append style={font=\footnotesize}]
+      \ppigraph{0}{1/red!70,2/red!40,3/white,4/blue!30,5/blue!60,6/red!20,7/white}{P1}
+      \ppigraph{3.6}{1/blue!50,2/white,3/red!60,4/red!30,5/white,6/blue!40,7/red!70}{P2}
+      \ppigraph{7.2}{1/white,2/blue!60,3/blue!20,4/red!70,5/red!40,6/white,7/blue!40}{P3}
+      \foreach \off/\p/\lab in {0/1/BRCA, 3.6/2/LUAD, 7.2/3/KIRC} {
+        \node at (\off+1.2,1.95) {Patient \p};
+        \node at (\off+1.2,-1.2) {$\mathbf{x}^{(\p)}$, \ $y^{(\p)}$ = \lab};
+      }
+      % colour scale
+      \shade[left color=blue!70, right color=red!70, middle color=white] (3.8,-1.85) rectangle (5.8,-1.65);
+      \draw[black!50] (3.8,-1.85) rectangle (5.8,-1.65);
+      \node[anchor=east, font=\scriptsize] at (3.8,-1.75) {low};
+      \node[anchor=west, font=\scriptsize] at (5.8,-1.75) {high};
+      \node[font=\scriptsize] at (4.8,-2.1) {expression ($z$-score)};
+    \end{tikzpicture}}
+    \caption{The same PPI graph with the expression profiles of three patients. Only the node values (colours) change between patients, while the structure is shared.}
+    \label{fig:sharedgraph}
+\end{figure}

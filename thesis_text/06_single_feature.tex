@@ -1,0 +1,7 @@
+% Problem setting: single feature per node, shared topology.
+Second, the input has a single feature per node, the expression of one gene, and the graph is the
+same for every patient: samples differ only in the values on the nodes, never in the topology.
+The graph therefore tells the model which genes are related, but cannot by itself separate the
+classes. This differs from the graph-classification benchmarks that dominate the pooling
+literature~\cite{morris2020tudataset}, where every sample has its own topology, the topology is
+often itself discriminative, and nodes usually carry several attributes.

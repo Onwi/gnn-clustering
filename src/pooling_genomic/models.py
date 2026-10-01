@@ -842,6 +842,57 @@ def _compute_cluster_schedule(n_start: int, n_final: int, levels: int) -> List[i
     return schedule
 
 
+LEARNED_POOLING_TYPES = ('diffpool', 'dmon')
+# Hybrid-mode controls: the trailing layer pools with a fixed (non-learned)
+# assignment instead of a learned one, so that everything else about the
+# model and its training protocol is identical to Hybrid DiffPool/DMoN.
+#   'hem'      -- one more precomputed HEM level (e.g. 221 -> 111 nodes at
+#                 n_hybrid=6); with n_hybrid=0 this is the 1-level Fixed HEM
+#                 architecture (14,133 -> 7,067 nodes).
+#   'spectral' -- spectral clustering of the trailing layer's input graph
+#                 into max_clusters groups: a fixed, structure-aware
+#                 clustering at the same bottleneck width as the learned
+#                 layer.
+#   'random'   -- a fixed, balanced random partition into max_clusters
+#                 groups: same bottleneck, no structure.
+FIXED_POOLING_TYPES = ('hem', 'spectral', 'random')
+
+
+def _fixed_trailing_parents(
+    kind: str,
+    edge_index: torch.Tensor,
+    edge_weight: torch.Tensor,
+    n: int,
+    k: int,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Fixed node -> cluster mapping (length ``n``, values ``0..k'-1``) for
+    the 'spectral' and 'random' trailing-layer controls. Deterministic for a
+    given graph and seed, so rebuilding the model (e.g. for the final retrain
+    or when reloading ``final_model.pt``) reproduces the same clusters."""
+    if kind == 'random':
+        g = torch.Generator().manual_seed(seed)
+        perm = torch.randperm(n, generator=g)
+        parents = torch.empty(n, dtype=torch.long)
+        parents[perm] = torch.arange(n) % k
+    elif kind == 'spectral':
+        import scipy.sparse
+        from sklearn.cluster import SpectralClustering
+
+        ei = edge_index.cpu().numpy()
+        ew = edge_weight.detach().cpu().numpy().astype(np.float64)
+        A = scipy.sparse.coo_matrix((ew, (ei[0], ei[1])), shape=(n, n)).tocsr()
+        A = (A + A.T) / 2
+        labels = SpectralClustering(
+            n_clusters=k, affinity='precomputed', assign_labels='cluster_qr', random_state=seed,
+        ).fit_predict(A)
+        _, labels = np.unique(labels, return_inverse=True)  # contiguous ids
+        parents = torch.from_numpy(labels).long()
+    else:
+        raise ValueError(f"unknown fixed trailing assignment {kind!r}")
+    return parents.to(edge_index.device)
+
+
 class DiffPoolGNN(nn.Module):
     """Hierarchical pooling GNN with learnable cluster assignments.
 
@@ -879,6 +930,15 @@ class DiffPoolGNN(nn.Module):
     apply ``assign_dropout`` to their raw assignment logits before the
     softmax (Tsitsulin et al., DMoN paper, JMLR 2023) whenever that branch
     is reached, hybrid mode's trailing layer included.
+
+    ``pooling_type`` may also be one of ``FIXED_POOLING_TYPES`` (hybrid mode
+    only): the trailing layer then pools with a fixed assignment instead of a
+    learned one and contributes no auxiliary loss. These are controls for
+    separating "learned vs. fixed clustering" from "how narrow the
+    bottleneck is" -- see ``FIXED_POOLING_TYPES``.
+
+    ``n_out_nodes`` is the number of nodes the last layer outputs, i.e. the
+    classifier input is ``n_out_nodes * last_channels``.
     """
     def __init__(
         self,
@@ -902,8 +962,19 @@ class DiffPoolGNN(nn.Module):
         super().__init__()
         self.max_filters = max_filters
 
-        if pooling_type not in ('diffpool', 'dmon'):
-            raise ValueError(f"pooling_type must be 'diffpool' or 'dmon', got {pooling_type!r}")
+        if pooling_type not in LEARNED_POOLING_TYPES + FIXED_POOLING_TYPES:
+            raise ValueError(
+                f"pooling_type must be one of {LEARNED_POOLING_TYPES + FIXED_POOLING_TYPES}, "
+                f"got {pooling_type!r}"
+            )
+        fixed_trailing = pooling_type in FIXED_POOLING_TYPES
+        if fixed_trailing and full_mode:
+            raise ValueError(f"pooling_type={pooling_type!r} is a hybrid-mode control; it has no full mode")
+        if fixed_trailing and (parents_list is None or len(parents_list) <= n_hybrid):
+            raise ValueError(
+                f"pooling_type={pooling_type!r} needs HEM parents for level {n_hybrid} "
+                f"(got {0 if parents_list is None else len(parents_list)} levels)"
+            )
         self.pooling_type = pooling_type
 
         self.register_buffer('base_edge_index', base_edge_index)
@@ -941,6 +1012,8 @@ class DiffPoolGNN(nn.Module):
         if parents_list is None:
             parents_list = []
 
+        # Fixed-trailing controls reuse DiffPoolLayer's HEM-scatter branch
+        # (aux losses are 0.0 there; their lambdas are 0 too).
         LayerClass = DMoNLayer if pooling_type == 'dmon' else DiffPoolLayer
         layer_extra_kwargs = {'assign_dropout': assign_dropout}
         if full_mode:
@@ -961,6 +1034,28 @@ class DiffPoolGNN(nn.Module):
                 parents = parents_list[i] if i < len(parents_list) else None
                 layer.set_coarse_edges(ei, ew, parents=parents)
             self.diffpool_layers.append(layer)
+
+        if fixed_trailing:
+            trailing = self.diffpool_layers[-1]
+            n_in = len(parents_list[n_hybrid])
+            if pooling_type == 'hem':
+                parents = parents_list[n_hybrid]
+            else:
+                ei, ew = coarse_edges[n_hybrid]
+                parents = _fixed_trailing_parents(
+                    pooling_type, ei, ew, n_in, _compute_pool_k(n_in, 2, max_clusters)
+                )
+            # The trailing layer's output graph is never consumed downstream.
+            trailing.set_coarse_edges(None, None, parents=parents)
+            self.n_out_nodes = int(parents.max()) + 1
+        elif full_mode:
+            prev = n_nodes
+            for target in cluster_schedule:
+                prev = _compute_pool_k(prev, 2, target) if prev is not None else target
+            self.n_out_nodes = prev
+        else:
+            n_in = len(parents_list[n_hybrid]) if len(parents_list) > n_hybrid else None
+            self.n_out_nodes = _compute_pool_k(n_in, 2, max_clusters) if n_in is not None else max_clusters
 
     def forward(self, X: torch.Tensor):
         num_samples, num_features = X.shape
@@ -1040,7 +1135,9 @@ def build_diffpool_model(
         instead of every layer collapsing to ``max_clusters`` in one hop
         (see ``DiffPoolGNN`` / ``_compute_cluster_schedule``).
     pooling_type : str
-        ``'diffpool'`` (default) or ``'dmon'`` -- see ``DiffPoolGNN``.
+        ``'diffpool'`` (default) or ``'dmon'``, or a hybrid-mode fixed-
+        trailing control ``'hem'``/``'spectral'``/``'random'`` -- see
+        ``DiffPoolGNN`` and ``FIXED_POOLING_TYPES``.
     sparsify_density : float, optional
         Full mode only: prune each level's pooled output adjacency to this
         fraction of edges per node instead of leaving it fully connected
@@ -1076,12 +1173,14 @@ def build_diffpool_model(
     else:
         levels = n_hybrid + 1
 
-    # Last layer always pools to max_clusters nodes → flatten. Channel
-    # doubling starts from encoder_channels in full mode (the pre-pooling
-    # encoder's output width) instead of the raw 1-dim input.
+    # Flatten the last layer's n_out_nodes nodes (max_clusters for the
+    # learned layers at every configuration run so far; the HEM/spectral/
+    # random controls' own cluster count otherwise). Channel doubling starts
+    # from encoder_channels in full mode (the pre-pooling encoder's output
+    # width) instead of the raw 1-dim input.
     start_channels = encoder_channels if full_mode else 1
     last_channels = min(start_channels * 2 ** levels, max_filters)
-    mlp_input_dim = max_clusters * last_channels
+    mlp_input_dim = gnn_model.n_out_nodes * last_channels
 
     mlp_model = FCModel(
         input_dim=mlp_input_dim,

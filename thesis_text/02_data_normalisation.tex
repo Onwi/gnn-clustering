@@ -1,0 +1,14 @@
+% Data chapter: source and normalisation of the expression values.
+% Verified: every gene is z-scored (mean 0, sample std 1) over all 7,709 samples; no further
+% scaling in the code. The underlying log unit cannot be recovered from the stored files.
+\paragraph{Source and normalisation.} The expression values were obtained from the UCSC Xena
+platform~\cite{goldman2020xena} as log-transformed \todo{$\log_2(\mathrm{TPM}+1)$ or log UQ-FPKM:
+confirm from the preprocessing records; the stored files cannot distinguish them} values, a
+transformation that compresses the heavy right tail of raw expression and stabilises its variance.
+Each gene is identified by its STRING-DB protein identifier, so the feature set is restricted to the
+14{,}133 protein-coding genes present in both the expression data and the PPI network. The stored
+values are additionally standardised per gene to zero mean and unit variance. This standardisation
+was computed over all 7{,}709 samples before the data were split, so the test samples contribute to
+the per-gene means and variances. The effect is limited to two summary statistics per gene and is
+shared by every model trained in this thesis, so it does not favour any of them; we nonetheless
+note it as a departure from strictly train-only preprocessing.

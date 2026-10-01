@@ -5,6 +5,134 @@ Each entry: what changed, why, files touched, and how it was verified.
 
 ---
 
+## 12. Result: fixed HEM vs learned DMoN at matched depth and width (2026-09-29)
+
+### What ran
+
+`BATCH_SIZE=32 CPU_PER_TRIAL=4 NUM_SAMPLES=8 ./scripts/run_fair_comparison_n6.sh hem dmon111` on the
+local RTX 3060 (12 GB), output `outputs/hem_vs_dmon111_n6/` (git-ignored). Both models: 6 HEM levels
+(14,133 -> 221 nodes), then 221 -> 111 nodes by one more HEM level (`hem`) or by learned DMoN
+(`--max-clusters 111`); 111 x 32 = 3,552 classifier inputs for both. 3 reps, 8 tuning trials,
+127-epoch warm-started retrain, `--shared-test-split` (seed 7, same 1,543 test samples),
+`--use-train-set-weights`. `hem` 36h45m (Sep 26 19:21 -> Sep 28 08:06), `dmon111` 37h07m (-> Sep 29 21:07).
+
+### Results (test accuracy, 1,543 samples)
+
+| | rep 0 | rep 1 | rep 2 | mean +/- std | balanced (mean) | ensemble (balanced) |
+|---|---|---|---|---|---|---|
+| Fixed HEM | 93.65 | 92.94 | 93.13 | 93.24 +/- 0.37 | 89.71 | 94.36 (90.88) |
+| Learned DMoN | 86.00 | 76.47 | 89.05 | 83.84 +/- 6.56 | 81.40 | 89.44 (86.75) |
+
+Paired sign tests on the shared test set (only-HEM-correct vs only-DMoN-correct): rep 0 153 vs 35
+(p = 9e-19), rep 1 285 vs 31 (p = 1e-52), rep 2 96 vs 33 (p = 3e-8), ensembles 98 vs 22 (p = 1e-12).
+HEM's ensemble F1 is higher on all 16 classes, most on ESCA, COAD, BLCA and KICH (+0.09 to +0.13).
+Tuned DMoN loss weights vary widely across reps (lambda_modularity 0.011-2.7, lambda_collapse
+0.014-8.9), with no consistent pattern. Script: `scripts/analysis/compare_hem_vs_dmon111.py`; raw
+output: `outputs/hem_vs_dmon111_n6/comparison_raw.txt`.
+
+### Interpretation and caveats
+
+- At equal depth, node count, classifier width, protocol and test samples, the fixed HEM grouping of
+  the last level beats the learned DMoN grouping in every rep, and is far more stable across reps.
+- DMoN at 111 clusters (83.8%) is no better than DMoN at 32 clusters on the lab machine (87.5%,
+  #9), so the classifier bottleneck width does not explain the learned models' deficit.
+- Reduced budget (batch 32, 8 trials) vs the n=6 learned runs (batch 96, 16 trials): these two runs
+  are comparable with each other only. With 8 trials, HEM tunes 2 hyperparameters and DMoN 4, so
+  DMoN's search is sparser; a 16-trial DMoN run would test whether that explains part of the gap.
+- Fixed HEM at 7 levels (93.2%) is below the earlier thesis's 1-level result (96.05%, different
+  protocol, 4x wider classifier input); `hem0` would measure the cost of depth under this protocol.
+
+---
+
+## 11. Fixed-trailing controls for a like-for-like Fixed vs. Learned comparison (2026-09-26)
+
+### Problem
+
+The headline comparison (Fixed HEM 96.05% vs. Hybrid n=6 at 83-88%) changes two things at once:
+how the last pooling step clusters (fixed vs. learned) and how many features reach the classifier.
+Fixed HEM's channel doubling cancels its node halving, so the 96.05% config (1 level, ChebConv,
+weighted pooling) feeds 7,067 x 2 = 14,134 features to the MLP -- the same width as the plain MLP
+(95.46%). Hybrid's learned layer always outputs `max_clusters=32` nodes x 32 channels = 1,024
+features (256 at n=2). The gap therefore cannot be attributed to learned clustering. On top of that,
+96.05% comes from the earlier thesis and was never re-run under the current protocol (and
+`coarsening_levels.py` still has the pre-fix tuning bugs: `scope="last"`, ASHA no-op, no checkpoint).
+
+| model | features into classifier |
+|---|---|
+| MLP / Fixed HEM 1 level (96.05%) | 14,133 / 14,134 |
+| Fixed HEM 5 / 6 / 7 levels | 14,144 / 7,072 / 3,552 |
+| Hybrid n=5, n=6 (learned) | 1,024 |
+
+### Fix
+
+New hybrid-mode `--pooling-type` values in `diffpool_experiment.py` that replace only the trailing
+learned assignment with a fixed one. Everything else is the Hybrid pipeline unchanged: same
+`DiffPoolGNN`, HEM early levels, training loop, tuning, warm-start retrain, split and ensembling.
+They have no auxiliary losses, so only `lr` and `weight_decay` are tuned.
+
+- `spectral`: spectral clustering (sklearn, `cluster_qr`, seed 0) of the trailing layer's input
+  graph into `max_clusters` groups -- a fixed, structure-aware clustering at the **same 1,024-feature
+  bottleneck** as learned DiffPool/DMoN. Learned vs. this is the cleanest "does learning the
+  clustering help" test.
+- `random`: fixed balanced random partition into `max_clusters` groups, same bottleneck -- the
+  "no structure" floor.
+- `hem`: one more precomputed HEM level (221 -> 111 at n=6, 3,552 features) = Fixed HEM at matched
+  depth under the current protocol. With `--n-hybrid 0` it is the 1-level Fixed HEM architecture
+  (14,134 features), i.e. a re-run of the 96.05% config under this protocol -- except it averages
+  instead of sums into parents and has no weighted pooling (it inherits the Hybrid layers).
+
+Widening the learned bottleneck needs no new code: `--max-clusters 221` at n=6 (7,072 features).
+`build_diffpool_model` now sizes the classifier from the model's actual output node count
+(`DiffPoolGNN.n_out_nodes`) instead of assuming `max_clusters`; that is identical for every
+configuration run so far, and previously crashed when `max_clusters` exceeded the trailing layer's
+node count.
+
+`scripts/run_fair_comparison_n6.sh` launches any of `spectral random hem hem0 dmon_wide` with the
+exact protocol of `run_hybrid_n6_full3.sh`, writing into `outputs/hybrid_n6_full3` (same shared test
+split) except `dmon_wide` (`outputs/hybrid_n6_wide`, its dir name would collide). `ensemble_predictions.py`
+and `analysis_v2/parsers.py` accept the new types.
+
+### Files changed
+
+- `src/pooling_genomic/models.py`: `FIXED_POOLING_TYPES`, `_fixed_trailing_parents()`,
+  `DiffPoolGNN` (fixed trailing assignment, `n_out_nodes`), `build_diffpool_model` (classifier width).
+- `scripts/experiments/diffpool_experiment.py`: new `--pooling-type` choices, zero aux lambdas for
+  them, `--full-mode` rejected with them.
+- `scripts/analysis/ensemble_predictions.py`, `scripts/analysis_v2/parsers.py`: new types.
+- `scripts/run_fair_comparison_n6.sh`: new.
+
+### Verification
+
+On the real graph (14,133 nodes, 8,165,154 edges) and `levels/`, RTX 3060:
+
+1. Existing `outputs/hybrid_n5_diffpool_full3/diffpool_hybrid5_rep0/final_model.pt` loads into a
+   freshly built n=5 DiffPool model (classifier input still 1,024), so learned-model shapes are
+   unchanged and past results stay valid.
+2. Classifier inputs: DiffPool n=2 256; DMoN n=6 1,024; `spectral`/`random` n=6 1,024; `hem` n=6
+   3,552; `hem` n=0 14,134; DMoN n=6 `--max-clusters 221` 7,072. Each variant ran a forward +
+   backward pass; eval-mode outputs repeat to <1e-6.
+3. `spectral` at n=6: 221 nodes -> 32 clusters (sizes 2-12); `random`: sizes 6-7; both identical
+   across rebuilds (needed so the warm-started final retrain and reloaded models see the same clusters).
+4. End-to-end CLI smoke run (`--pooling-type spectral --n-hybrid 6 --tune`, 2 reps,
+   `--shared-test-split`, 1 tuning sample, `--n-cycles 2`, batch 32 on the 12 GB GPU; batch 64
+   OOMs there): both reps tuned, saved a checkpoint, printed "Warm-started final retrain", ran the
+   3-epoch retrain and wrote `final_model_results/` with all lambdas 0.0 in `model_configs.json`;
+   `ensemble_predictions.py --pooling-type spectral` then ran on the two reps (85.16%). The
+   accuracies from this tiny budget say nothing about the control's real performance.
+
+### Not addressed
+
+- Protocol left identical to the n=6 runs on purpose, so those results stay comparable without a
+  rerun. Two protocol quirks therefore remain in all runs: `--use-train-set-weights` computes class
+  weights over the whole dataset (test included -- class proportions only), and the kept Ray Tune
+  checkpoint is the best-*accuracy* epoch while the trial is picked by best *loss*.
+- The trailing layer of the fixed controls still owns an unused `pool_gnn` (2,080 parameters
+  at n=6, never receiving a gradient), so reported parameter counts are slightly inflated.
+- Fontanari's exact Fixed HEM (sum pooling, weighted pooling) is not re-run; `coarsening_levels.py`
+  still has the old tuning bugs if it is used.
+
+---
+
 ## 10. Three minor cleanups found reviewing Full DMoN (2026-09-25)
 
 Found in a read-only review of the Full DMoN path. None changes accuracy; the third slightly

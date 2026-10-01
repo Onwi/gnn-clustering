@@ -1,0 +1,51 @@
+% Background: the Chebyshev convolution used in this work, and why convolutions alone fall short.
+% Verified against PyTorch Geometric's ChebConv (lambda_max = 2, bias on) and the models' code
+% (ReLU after each convolution, no norm/dropout, channels 1 -> 32). The 99% two-hop figure was
+% measured over 300 randomly sampled genes of the loaded graph.
+% New bib entries: fey2019pyg, li2018deeper.
+\section{Chebyshev Graph Convolution}
+\label{sec:chebconv}
+
+All graph models in this thesis use the Chebyshev convolution of Defferrard
+et al.~\cite{defferrard2016chebnet}. It is defined through the normalised graph Laplacian
+$L = I - D^{-1/2} A D^{-1/2}$, where $D$ is the weighted degree matrix. Spectral filters act on
+the eigenvalues of $L$, but applying them exactly requires an eigendecomposition whose cost is
+cubic in the number of nodes. ChebNet avoids it by using a polynomial filter of degree $K-1$ in the
+rescaled Laplacian $\tilde{L} = 2L/\lambda_{\max} - I$, written in the Chebyshev basis
+$T_0(z) = 1$, $T_1(z) = z$, $T_k(z) = 2zT_{k-1}(z) - T_{k-2}(z)$:
+\begin{equation}
+Y = \sum_{k=0}^{K-1} T_k(\tilde{L})\, X\, \Theta_k ,
+\label{eq:cheb}
+\end{equation}
+where $X \in \mathbb{R}^{n \times F_{\mathrm{in}}}$ holds the node features and
+$\Theta_k \in \mathbb{R}^{F_{\mathrm{in}} \times F_{\mathrm{out}}}$ are learned. The output at a node
+depends only on nodes within $K-1$ hops, and it is computed with sparse matrix products, without
+diagonalising $L$.
+
+We use $K = 2$ throughout, as implemented in PyTorch Geometric~\cite{fey2019pyg}, which sets
+$\lambda_{\max} = 2$, the upper bound of the normalised Laplacian's spectrum. Then
+$\tilde{L} = -D^{-1/2} A D^{-1/2}$ and Equation~\eqref{eq:cheb} reduces to
+\begin{equation}
+Y = X\,\Theta_0 \;-\; D^{-1/2} A D^{-1/2}\, X\,\Theta_1 \;+\; b :
+\label{eq:cheb-k2}
+\end{equation}
+each gene combines its own features with a degree-normalised, confidence-weighted sum of its direct
+neighbours' features, with separate weights for the two, so information travels one edge per layer.
+The GCN of Kipf and Welling~\cite{kipf2017gcn} is the special case with tied weights and added
+self-loops. Each convolution is followed by a ReLU, with no normalisation layer or dropout, and acts
+on the graph of its own pooling level. The first convolution receives a single channel, the gene's
+standardised expression, and the width doubles at each pooling level up to 32 channels.
+
+\section{Limits of Local Convolutions on This Graph}
+\label{sec:limits}
+
+Convolutions alone fit this problem poorly for three reasons. First, the graph is dense: a gene
+has 578 neighbours on average, and two hops already reach about 99\% of all genes. After two
+layers, each gene's state therefore mixes information from almost the whole graph, so additional
+depth adds little specificity and risks making node states alike~\cite{li2018deeper}, while nothing
+in the convolution represents functional modules such as pathways or complexes. Second, a
+graph-level classifier that flattens every node state needs $n_0 \times F$ inputs, about $452{,}000$
+at 32 channels. Third, every layer processes all $14{,}133$ nodes for every patient at every
+training step. Pooling addresses all three by computing on a smaller graph of clusters, at the price
+of deciding which genes to group together: the subject of the next chapter, and of the comparison
+between fixed and learned grouping in this thesis.

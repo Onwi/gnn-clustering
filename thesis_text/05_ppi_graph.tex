@@ -1,0 +1,12 @@
+% Data chapter: the PPI graph as used by the models (all numbers verified on the loaded graph).
+After the mapping described in Section~\ref{sec:tcga}, the network has 14{,}133 nodes, forming a
+single connected component with no isolated genes. We use all interactions reported by STRING
+(v11.5)~\todo{cite STRING v11.5}, whose own reporting floor is a combined confidence score of 150;
+no further confidence threshold is applied. Each edge is weighted by its combined score divided by
+1{,}000, giving weights in $[0.15, 0.999]$. The graph contains 4{,}082{,}577 undirected
+interactions, stored as 8{,}165{,}154 directed edge entries (one per direction, with identical
+weights). This corresponds to a density of about $0.04$ and a mean of about 578 neighbours per gene
+(median 463, range 1 to 5{,}971), so the network is dense by the standards of PPI graphs and has a
+heavy-tailed degree distribution. Edge weights matter later: they drive the Heavy Edge Matching used
+for fixed pooling (Chapter~\ref{chap:pooling}), whose coarsened graphs store their edge weights
+min-max rescaled to $[0, 1]$ at each level.

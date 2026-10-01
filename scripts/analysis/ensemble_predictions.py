@@ -72,7 +72,7 @@ def build_report(reps, ensemble_acc, ensemble_bal_acc, n_hybrid, pooling_type, n
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--path-output", type=str, required=True)
-    parser.add_argument("--pooling-type", type=str, required=True, choices=["diffpool", "dmon"])
+    parser.add_argument("--pooling-type", type=str, required=True, choices=["diffpool", "dmon", "hem", "spectral", "random"])
     parser.add_argument("--n-hybrid", type=int, required=True)
     parser.add_argument("--n-holdouts", type=int, required=True)
     parser.add_argument("--out", type=str, default=None)
