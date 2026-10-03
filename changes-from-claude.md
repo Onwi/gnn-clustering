@@ -5,6 +5,26 @@ Each entry: what changed, why, files touched, and how it was verified.
 
 ---
 
+## 13. `--metadata-column` was ignored for the pan-cancer dataset; tumour-vs-normal launch options (2026-10-03)
+
+**Bug:** `get_genomic_classification_dataset` set `kwargs['metadata_column'] = 'cohort'` for
+`tcga_cohorts_and_tumor_classification` unconditionally (added in `cb5be64` to supply a missing
+default), overriding an explicit `--metadata-column sample_type`. A tumour-vs-normal run would have
+silently trained cohort classification. Now `kwargs.setdefault(...)`. Verified: no flag -> 16
+cohorts, unchanged split (4,625/1,541/1,543); `sample_type` -> 2 classes, same split. No past run
+passed the flag, so no result changes.
+
+**Launch script:** `scripts/run_fair_comparison_n6.sh` gains `METADATA_COLUMN` (passed as
+`--metadata-column`, also used by the pre-flight probe) and `RUN_TAG` (log/pid file names, so a new
+run does not overwrite an earlier log).
+
+Also added `scripts/analysis/fontanari_fig4_comparison.py`: metrics from the hand-transcribed cohort
+confusion matrix of Fontanari & Recamonde-Mendoza (arXiv:2601.06381, Fig. 4a), whose row totals
+match our shared test split class by class (90.54% accuracy, F1-macro 0.864, vs. our fixed HEM
+93.24% / 0.896 on the same samples).
+
+---
+
 ## 12. Result: fixed HEM vs learned DMoN at matched depth and width (2026-09-29)
 
 ### What ran
