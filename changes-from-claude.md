@@ -133,6 +133,52 @@ On the real graph (14,133 nodes, 8,165,154 edges) and `levels/`, RTX 3060:
 
 ---
 
+## 14. `--disable-per-patient-graphs`: make #13's finding-4 fix optional (2026-10-05)
+
+### Why
+
+Launched `scripts/run_full_dmon_111_fixed.sh` (#13, all four ideas combined, batch 2 forced by
+memory) for ~3 days: 3/6 tuning trials OOM'd (one-off 32.86 GiB spikes the short probe never hit),
+and the 31-epoch final retrain never converged (train_loss stuck at 2.45-2.58, barely below
+ln(16)=2.77; test accuracy 24-34% throughout, no improvement near epoch 30 the way #10's run
+showed) -- final result 32.3% accuracy, 23.75% balanced, well below the pre-#13 71.16%.
+
+Confounded: four code changes plus a forced batch-size cut from 6 to 2 landed in one run, so this
+result cannot say which factor (or combination) caused it. Re-probed to separate them: dropping
+only the deeper assignment head (finding 1) does **not** recover batch size -- batch 6/4 still OOM,
+batch 2 is still the ceiling. Dropping finding 4 (per-patient graphs) as well, even with everything
+else back to original defaults, is what actually frees memory: the fix's dense per-edge gather
+tensor (`_pool_adjacency_batched`) is the dominant cost, not the deeper head or the wider encoder.
+
+### Change
+
+New `per_patient_graphs: bool = True` parameter, threaded through
+`DiffPoolLayer`/`DMoNLayer`/`DiffPoolGNN`/`build_diffpool_model`, and a new
+`--disable-per-patient-graphs` CLI flag (default off, i.e. per-patient graphs stay on by default).
+When disabled, full-mode layers build the original batch-averaged output graph
+(`_build_pooled_output_graph`) instead of the per-patient one, reinstating the batch-composition
+dependence #13 fixed, in exchange for far less memory (no dense `(num_edges, k+1)` gather tensor).
+
+### Verification
+
+1. Flag off reproduces the pre-#13 batch-dependence on a synthetic full-mode model (diff ~0.03,
+   patient 0 alone vs. batched) -- confirms the flag actually switches code paths, not a no-op.
+2. Flag on (default) stays batch-independent, same as #13 (diff ~4e-7).
+3. Forward+backward runs cleanly with the flag off.
+4. Real graph, `pool_gnn_layers=1`, `encoder_channels=32`, `encoder_layers=3`,
+   `per_patient_graphs=False`: batch 8 and 6 OOM, batch 4 stable (4/4 seeds x 15 iterations),
+   11.23 GB peak, 3.50 s/step median -> ~67 min/epoch pure-step. Batch recovered from 2 to 4, not
+   all the way back to 6 -- the wider encoder alone still costs real memory at this bottleneck
+   width.
+
+### Files changed
+
+- `src/pooling_genomic/models.py`: `per_patient_graphs` param on `DiffPoolLayer`, `DMoNLayer`,
+  `DiffPoolGNN`, `build_diffpool_model`; output-graph branch in both layers' `forward`.
+- `scripts/experiments/diffpool_experiment.py`: `--disable-per-patient-graphs` flag.
+
+---
+
 ## 13. Four Full DMoN improvement ideas: deeper assignment head, per-level-normalized
 collapse loss, per-patient pooled graphs, wider encoder (2026-10-01)
 

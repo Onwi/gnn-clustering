@@ -664,15 +664,23 @@ class DiffPoolLayer(nn.Module):
         Depth of the assignment head (`pool_gnn`); see `PoolAssignmentHead`.
         Default 1 is a plain single `ChebConv`, identical to the original
         code.
+    per_patient_graphs : bool
+        Full mode only. True (default): each sample's own pooled graph
+        feeds the next level (see `_build_pooled_output_graph_batched`).
+        False: the pre-fix batch-averaged graph (`_build_pooled_output_graph`)
+        -- costs much less memory (no dense per-edge gather tensor) at the
+        price of reintroducing batch-composition dependence; see
+        changes-from-claude.md #13/#14.
     """
     def __init__(self, in_channels: int, hidden_channels: int, max_clusters: int, K: int = 2,
                  sparsify_density: Optional[float] = None, assign_dropout: float = 0.5,
-                 pool_gnn_layers: int = 1):
+                 pool_gnn_layers: int = 1, per_patient_graphs: bool = True):
         super().__init__()
         self.embed_gnn = ChebConv(in_channels, hidden_channels, K=K)
         self.pool_gnn = _build_pool_assignment_head(in_channels, max_clusters, K, pool_gnn_layers)
         self.sparsify_density = sparsify_density
         self.assign_dropout = assign_dropout
+        self.per_patient_graphs = per_patient_graphs
         self._coarse_edge_index: Optional[torch.Tensor] = None
         self._coarse_edge_weight: Optional[torch.Tensor] = None
         self._parents: Optional[torch.Tensor] = None
@@ -798,13 +806,16 @@ class DiffPoolLayer(nn.Module):
         # --- output graph: a hybrid trailing layer or full mode's last
         # level has nothing downstream to consume one (`DiffPoolGNN.forward`
         # reshapes x_next straight to the classifier), so skip building it.
-        # Otherwise (full mode, not the last level) build each sample's own
-        # pooled graph and flatten x_next to match.
+        # Otherwise (full mode, not the last level) build either each
+        # sample's own pooled graph (flattening x_next to match) or the
+        # cheaper batch-averaged one, per `self.per_patient_graphs`.
         if is_last_level:
             edge_index_next, edge_weight_next = None, None
-        else:
+        elif self.per_patient_graphs:
             edge_index_next, edge_weight_next = _build_pooled_output_graph_batched(A_next_dense, k, self.sparsify_density)
             x_next = x_next.reshape(batch_size * k, -1)
+        else:
+            edge_index_next, edge_weight_next = _build_pooled_output_graph(A_next_dense, k, self.sparsify_density)
 
         return x_next, edge_index_next, edge_weight_next, aux
 
@@ -859,6 +870,13 @@ class DMoNLayer(nn.Module):
         Depth of the assignment head (`pool_gnn`); see `PoolAssignmentHead`.
         Default 1 is a plain single `ChebConv`, identical to the original
         code.
+    per_patient_graphs : bool
+        Full mode only. True (default): each sample's own pooled graph
+        feeds the next level (see `_build_pooled_output_graph_batched`).
+        False: the pre-fix batch-averaged graph (`_build_pooled_output_graph`)
+        -- costs much less memory (no dense per-edge gather tensor) at the
+        price of reintroducing batch-composition dependence; see
+        changes-from-claude.md #13/#14.
     """
     def __init__(
         self,
@@ -869,12 +887,14 @@ class DMoNLayer(nn.Module):
         sparsify_density: Optional[float] = None,
         assign_dropout: float = 0.5,
         pool_gnn_layers: int = 1,
+        per_patient_graphs: bool = True,
     ):
         super().__init__()
         self.embed_gnn = ChebConv(in_channels, hidden_channels, K=K)
         self.pool_gnn = _build_pool_assignment_head(in_channels, max_clusters, K, pool_gnn_layers)
         self.sparsify_density = sparsify_density
         self.assign_dropout = assign_dropout
+        self.per_patient_graphs = per_patient_graphs
         self._coarse_edge_index: Optional[torch.Tensor] = None
         self._coarse_edge_weight: Optional[torch.Tensor] = None
         self._parents: Optional[torch.Tensor] = None
@@ -1017,13 +1037,16 @@ class DMoNLayer(nn.Module):
         # --- output graph: a hybrid trailing layer or full mode's last
         # level has nothing downstream to consume one (`DiffPoolGNN.forward`
         # reshapes x_next straight to the classifier), so skip building it.
-        # Otherwise (full mode, not the last level) build each sample's own
-        # pooled graph and flatten x_next to match.
+        # Otherwise (full mode, not the last level) build either each
+        # sample's own pooled graph (flattening x_next to match) or the
+        # cheaper batch-averaged one, per `self.per_patient_graphs`.
         if is_last_level:
             edge_index_next, edge_weight_next = None, None
-        else:
+        elif self.per_patient_graphs:
             edge_index_next, edge_weight_next = _build_pooled_output_graph_batched(A_next_dense, k, self.sparsify_density)
             x_next = x_next.reshape(batch_size * k, -1)
+        else:
+            edge_index_next, edge_weight_next = _build_pooled_output_graph(A_next_dense, k, self.sparsify_density)
 
         return x_next, edge_index_next, edge_weight_next, aux
 
@@ -1200,6 +1223,12 @@ class DiffPoolGNN(nn.Module):
     ``pool_gnn_layers`` sets every layer's assignment-head depth (default 1,
     a plain single ``ChebConv``, identical to the original code); see
     ``PoolAssignmentHead``.
+
+    ``per_patient_graphs`` (full mode only, default True) controls whether
+    each non-last level builds its own per-sample pooled graph for the next
+    level (correct, but costs a dense per-edge gather tensor) or the
+    original batch-averaged one (much cheaper, batch-composition-dependent
+    -- see changes-from-claude.md #13/#14).
     """
     def __init__(
         self,
@@ -1220,6 +1249,7 @@ class DiffPoolGNN(nn.Module):
         sparsify_density: Optional[float] = None,
         assign_dropout: float = 0.5,
         pool_gnn_layers: int = 1,
+        per_patient_graphs: bool = True,
     ):
         super().__init__()
         self.max_filters = max_filters
@@ -1277,7 +1307,10 @@ class DiffPoolGNN(nn.Module):
         # Fixed-trailing controls reuse DiffPoolLayer's HEM-scatter branch
         # (aux losses are 0.0 there; their lambdas are 0 too).
         LayerClass = DMoNLayer if pooling_type == 'dmon' else DiffPoolLayer
-        layer_extra_kwargs = {'assign_dropout': assign_dropout, 'pool_gnn_layers': pool_gnn_layers}
+        layer_extra_kwargs = {
+            'assign_dropout': assign_dropout, 'pool_gnn_layers': pool_gnn_layers,
+            'per_patient_graphs': per_patient_graphs,
+        }
         if full_mode:
             layer_extra_kwargs['sparsify_density'] = sparsify_density
 
@@ -1363,6 +1396,7 @@ def build_diffpool_model(
     sparsify_density: Optional[float] = None,
     assign_dropout: float = 0.5,
     pool_gnn_layers: int = 1,
+    per_patient_graphs: bool = True,
     **kwargs,
 ):
     """Build a DiffPool- or DMoN-based hierarchical pooling classifier.
@@ -1417,6 +1451,10 @@ def build_diffpool_model(
     pool_gnn_layers : int
         Depth of every layer's assignment head. Default 1 is a plain single
         `ChebConv`, identical to the original code; see `PoolAssignmentHead`.
+    per_patient_graphs : bool
+        Full mode only, default True: each non-last level's own pooled
+        graph feeds the next level, instead of the cheaper but batch-
+        composition-dependent batch-averaged graph. See `DiffPoolGNN`.
     """
     gnn_model = DiffPoolGNN(
         base_edge_index=base_graph.edge_index,
@@ -1436,6 +1474,7 @@ def build_diffpool_model(
         sparsify_density=sparsify_density,
         assign_dropout=assign_dropout,
         pool_gnn_layers=pool_gnn_layers,
+        per_patient_graphs=per_patient_graphs,
     )
 
     if full_mode:

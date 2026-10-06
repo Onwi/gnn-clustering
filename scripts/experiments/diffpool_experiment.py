@@ -213,6 +213,7 @@ def train_and_validate_model(
         sparsify_density=args.sparsify_density,
         assign_dropout=args.assign_dropout,
         pool_gnn_layers=args.pool_gnn_layers,
+        per_patient_graphs=not args.disable_per_patient_graphs,
     )
     model = model.to(device=device)
 
@@ -369,6 +370,12 @@ def parse_args():
                              "node's cluster. A value >1 stacks ReLU-separated ChebConv layers "
                              "first, giving the assignment decision a wider receptive field before "
                              "the final projection to --max-clusters.")
+    parser.add_argument("--disable-per-patient-graphs", action="store_true",
+                        help="Full mode only: use the original batch-averaged pooled graph for each "
+                             "level's output instead of each sample's own graph. Costs much less "
+                             "memory (no dense per-edge gather tensor), at the price of a patient's "
+                             "prediction depending on which other patients share its batch (see "
+                             "changes-from-claude.md #13/#14). Default off (per-patient graphs on).")
     parser.add_argument("--sparsify-density", type=float, default=None,
                         help="Full mode only: prune each level's pooled output adjacency to this "
                              "fraction of edges per node (e.g. 0.04, matching stringdb_top100pc.csv's "
@@ -526,6 +533,7 @@ def train_and_test_model(results, args, path_experiment, n_hybrid, random_state,
         sparsify_density=args.sparsify_density,
         assign_dropout=args.assign_dropout,
         pool_gnn_layers=args.pool_gnn_layers,
+        per_patient_graphs=not args.disable_per_patient_graphs,
     )
     model = model.to(device=device)
 
