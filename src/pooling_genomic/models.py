@@ -670,7 +670,7 @@ class DiffPoolLayer(nn.Module):
         False: the pre-fix batch-averaged graph (`_build_pooled_output_graph`)
         -- costs much less memory (no dense per-edge gather tensor) at the
         price of reintroducing batch-composition dependence; see
-        changes-from-claude.md #13/#14.
+        changes-from-claude.md #13/#15.
     """
     def __init__(self, in_channels: int, hidden_channels: int, max_clusters: int, K: int = 2,
                  sparsify_density: Optional[float] = None, assign_dropout: float = 0.5,
@@ -876,7 +876,7 @@ class DMoNLayer(nn.Module):
         False: the pre-fix batch-averaged graph (`_build_pooled_output_graph`)
         -- costs much less memory (no dense per-edge gather tensor) at the
         price of reintroducing batch-composition dependence; see
-        changes-from-claude.md #13/#14.
+        changes-from-claude.md #13/#15.
     """
     def __init__(
         self,
@@ -1228,7 +1228,7 @@ class DiffPoolGNN(nn.Module):
     each non-last level builds its own per-sample pooled graph for the next
     level (correct, but costs a dense per-edge gather tensor) or the
     original batch-averaged one (much cheaper, batch-composition-dependent
-    -- see changes-from-claude.md #13/#14).
+    -- see changes-from-claude.md #13/#15).
     """
     def __init__(
         self,

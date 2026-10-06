@@ -375,7 +375,7 @@ def parse_args():
                              "level's output instead of each sample's own graph. Costs much less "
                              "memory (no dense per-edge gather tensor), at the price of a patient's "
                              "prediction depending on which other patients share its batch (see "
-                             "changes-from-claude.md #13/#14). Default off (per-patient graphs on).")
+                             "changes-from-claude.md #13/#15). Default off (per-patient graphs on).")
     parser.add_argument("--sparsify-density", type=float, default=None,
                         help="Full mode only: prune each level's pooled output adjacency to this "
                              "fraction of edges per node (e.g. 0.04, matching stringdb_top100pc.csv's "
