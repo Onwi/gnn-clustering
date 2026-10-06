@@ -27,6 +27,8 @@
 #
 # Overridable via environment (defaults = the n=6 protocol on the RTX 3090 Ti):
 #   BATCH_SIZE=96 CPU_PER_TRIAL=8 NUM_SAMPLES=16 OUTDIR=... WIDE_OUTDIR=...
+#   METADATA_COLUMN=sample_type   (label; default: cohort -- tumour vs normal with sample_type)
+#   RUN_TAG=fair_comparison_n6    (name of the .log/.pid files in the repo root)
 # Changing BATCH_SIZE or NUM_SAMPLES makes the runs comparable only with each
 # other, not with outputs/hybrid_n6_full3.
 #
@@ -55,6 +57,8 @@ done
 BATCH_SIZE="${BATCH_SIZE:-96}"
 CPU_PER_TRIAL="${CPU_PER_TRIAL:-8}"
 NUM_SAMPLES="${NUM_SAMPLES:-16}"
+METADATA_COLUMN="${METADATA_COLUMN:-}"
+RUN_TAG="${RUN_TAG:-fair_comparison_n6}"
 
 if ! command -v conda >/dev/null 2>&1; then echo "ERROR: conda not found on PATH." >&2; exit 1; fi
 source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -71,16 +75,18 @@ for f in "$DATASET" "$LEVELS" "$NETWORK"; do
 done
 
 echo "Pre-flight: batch-size=$BATCH_SIZE forward/backward probe for: ${RUNS[*]} ..."
-python - "$DATASET" "$NETWORK" "$LEVELS" "$BATCH_SIZE" "${RUNS[@]}" <<'PYEOF'
+python - "$DATASET" "$NETWORK" "$LEVELS" "$BATCH_SIZE" "${METADATA_COLUMN:-cohort}" "${RUNS[@]}" <<'PYEOF'
 import sys, torch
 from pooling_genomic.datasets import get_genomic_classification_dataset
 from pooling_genomic.models import build_diffpool_model
 from pooling_genomic.networks import get_pyg_data, load_coarse_edges_for_diffpool
 from torch.optim import AdamW
 
-path_dataset, path_network, path_levels, batch_size, *runs = sys.argv[1:]
+path_dataset, path_network, path_levels, batch_size, metadata_column, *runs = sys.argv[1:]
 batch_size = int(batch_size)
-_, _, _, dataset = get_genomic_classification_dataset(path_dataset=path_dataset, return_original_set=True, random_state=0)
+_, _, _, dataset = get_genomic_classification_dataset(
+    path_dataset=path_dataset, return_original_set=True, random_state=0, metadata_column=metadata_column)
+print(f"Label '{metadata_column}': {dataset.get_n_classes()} classes {list(dataset.label_encoder.classes_)}")
 base_graph = get_pyg_data(genes=dataset.get_genes(), path_to_csv=path_network).to("cuda")
 coarse_edges, parents_list = load_coarse_edges_for_diffpool(path_levels=path_levels, n_levels=8, device="cuda")
 spec = {
@@ -134,6 +140,7 @@ run_one () {
     --tune --num-samples "$NUM_SAMPLES" --n-cycles 7 \
     --batch-size "$BATCH_SIZE" --device cuda --gpu-per-trial 1 --cpu-per-trial "$CPU_PER_TRIAL" \
     --n-holdouts 3 --shared-test-split --use-train-set-weights \
+    ${METADATA_COLUMN:+--metadata-column "$METADATA_COLUMN"} \
     --path-output "$outdir"
   echo "FAIR_COMPARISON_TIMER $run end $(date +%s)"
   python scripts/analysis/ensemble_predictions.py \
@@ -142,12 +149,12 @@ run_one () {
 }
 
 export -f run_one
-export DATASET LEVELS NETWORK OUTDIR WIDE_OUTDIR BATCH_SIZE CPU_PER_TRIAL NUM_SAMPLES
+export DATASET LEVELS NETWORK OUTDIR WIDE_OUTDIR BATCH_SIZE CPU_PER_TRIAL NUM_SAMPLES METADATA_COLUMN
 
-echo "Pre-flight passed. Launching in the background: ${RUNS[*]} (batch=$BATCH_SIZE, samples=$NUM_SAMPLES, out=$OUTDIR)"
+echo "Pre-flight passed. Launching in the background: ${RUNS[*]} (batch=$BATCH_SIZE, samples=$NUM_SAMPLES, label=${METADATA_COLUMN:-cohort}, out=$OUTDIR)"
 nohup bash -c 'for r in "$@"; do run_one "$r"; done' _ "${RUNS[@]}" \
-  > "$REPO_ROOT/fair_comparison_n6.log" 2>&1 &
+  > "$REPO_ROOT/$RUN_TAG.log" 2>&1 &
 PID=$!
 disown
-echo "$PID" > "$REPO_ROOT/fair_comparison_n6.pid"
-echo "Launched. PID=$PID  Log: $REPO_ROOT/fair_comparison_n6.log"
+echo "$PID" > "$REPO_ROOT/$RUN_TAG.pid"
+echo "Launched. PID=$PID  Log: $REPO_ROOT/$RUN_TAG.log"
